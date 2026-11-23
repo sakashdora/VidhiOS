@@ -1,0 +1,6 @@
+{
+  "name": "VidhiOS",
+  "description": "AI Legal Intelligence Workspace for Indian Litigation, Corporate M&A Due Diligence, and Global Multi-Jurisdiction Practice.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
