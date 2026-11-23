@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { requireAuth, signSessionToken, type AuthRequest } from './auth.js';
 import { repository } from './repository.js';
@@ -50,9 +49,6 @@ import {
 import { lookupStatuteMappings } from '../lib/legal/statuteCrosswalk.js';
 import { parseWhatsAppCommand } from '../lib/legal/whatsappParser.js';
 import type { AssistantCompletedAction, AssistantVerifiedSource } from '../types/legal.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
@@ -1591,7 +1587,9 @@ Recommended Next Filings: ${analysis.recommendedFilings.map((f) => f.title).join
   // --- Frontend Mounting (Vite Dev Middleware or Production Static) ---
   if (includeStatic) {
     if (!IS_PROD) {
-      const { createServer: createViteServer } = await import('vite');
+      // Non-literal specifier keeps Vite (a dev-only tool) out of the Netlify Function bundle.
+      const viteModuleName = 'vite';
+      const { createServer: createViteServer } = (await import(viteModuleName)) as typeof import('vite');
       const vite = await createViteServer({
         server: { middlewareMode: true },
         appType: 'spa',

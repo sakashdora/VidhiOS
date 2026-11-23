@@ -10,7 +10,6 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
-  timeout = 26
 
 # Direct all backend /api calls to the Netlify Function handler
 [[redirects]]
