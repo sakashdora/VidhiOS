@@ -363,7 +363,7 @@ export function ResearchModule({
                   {currentStage?.label || 'Processing legal query...'}
                 </h3>
                 <p className="text-[11px] text-ink-muted">
-                  Model: {modelTier === 'fast' ? 'nvidia/nemotron-3.5-lightning-30b-a3b' : 'mistralai/mistral-large-4-1t-a52b'} · Real-time SSE Stream
+                  Model: {modelTier === 'fast' ? 'Nemotron 30B Lightning' : 'Mistral Large 2 (Instruct)'} · Real-time SSE Stream
                 </p>
               </div>
             </div>

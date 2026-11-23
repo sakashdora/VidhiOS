@@ -31,12 +31,12 @@ const TRANSCRIBE_MODEL = 'gemini-3.5-transcribe';
 
 export function isGeminiConfigured(): boolean {
   const key = (process.env.GEMINI_API_KEY ?? '').trim();
-  return Boolean(key && key !== 'MY_GEMINI_API_KEY');
+  return Boolean(key && !key.startsWith('MY_') && key.length > 5);
 }
 
 function getAiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey || apiKey.startsWith('MY_')) {
     throw new Error(
       'AI provider key is not configured. Add NVIDIA_API_KEY (or GEMINI_API_KEY) in Settings > Secrets.'
     );
