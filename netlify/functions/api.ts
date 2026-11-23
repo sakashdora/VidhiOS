@@ -12,7 +12,13 @@ export const handler = async (event: any, context: any) => {
 
   if (!serverlessHandler) {
     const app = await createExpressApp({ includeStatic: false });
-    serverlessHandler = serverless(app);
+    serverlessHandler = serverless(app, {
+      request(req: any) {
+        if (req.url && req.url.startsWith('/.netlify/functions/api')) {
+          req.url = req.url.replace('/.netlify/functions/api', '/api');
+        }
+      },
+    });
   }
 
   return serverlessHandler(event, context);

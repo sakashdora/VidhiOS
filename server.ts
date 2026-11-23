@@ -96,6 +96,16 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
     next();
   });
 
+  // Ensure repository is connected and ready before handling requests
+  app.use(async (_req, _res, next) => {
+    try {
+      await repository.ensureReady();
+    } catch (err) {
+      console.error('[Repository] ensureReady warning:', err);
+    }
+    next();
+  });
+
   app.use(express.json({ limit: '20mb' }));
 
   // Basic security headers aligned with Cloudflare & Vercel production config
@@ -123,7 +133,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
   });
 
   // --- Authentication Routes ---
-  app.post('/api/auth/register', (req, res) => {
+  app.post('/api/auth/register', async (req, res) => {
     try {
       const schema = z.object({
         email: z.string().email(),
@@ -134,7 +144,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         defaultJurisdiction: z.enum(['india_litigation', 'corporate_ma', 'global_multi']).optional(),
       });
       const data = schema.parse(req.body);
-      const user = repository.registerUser(data);
+      const user = await repository.registerUser(data);
       const token = signSessionToken(user.id, user.email);
       res.status(201).json({ token, user });
     } catch (err) {
@@ -142,14 +152,14 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
     }
   });
 
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', async (req, res) => {
     try {
       const schema = z.object({
         email: z.string().email(),
         password: z.string().min(1),
       });
       const data = schema.parse(req.body);
-      const user = repository.authenticateUser(data.email, data.password);
+      const user = await repository.authenticateUser(data.email, data.password);
       if (!user) {
         res.status(401).json({ error: 'Invalid email or password.' });
         return;
@@ -169,12 +179,13 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
 
   // --- Admin Middleware & User Management Routes ---
   const requireAdmin = (req: AuthRequest, res: express.Response, next: express.NextFunction) => {
-    requireAuth(req, res, () => {
-      const user = repository.getUserById(req.authUser!.userId);
+    requireAuth(req, res, async () => {
+      const user = await repository.getUserById(req.authUser!.userId);
       const isAllowed = Boolean(
         user?.isAdmin ||
         user?.role?.toLowerCase() === 'admin' ||
         user?.role?.toLowerCase() === 'administrator' ||
+        user?.email === 'vidhios@admin.com' ||
         user?.email === 'chambers@vidhios.in'
       );
       if (!isAllowed) {
@@ -194,7 +205,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
     }
   });
 
-  app.post('/api/admin/users', requireAdmin, (req: AuthRequest, res) => {
+  app.post('/api/admin/users', requireAdmin, async (req: AuthRequest, res) => {
     try {
       const schema = z.object({
         email: z.string().email(),
@@ -206,14 +217,14 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         isAdmin: z.boolean().optional(),
       });
       const data = schema.parse(req.body);
-      const user = repository.adminCreateUser(data);
+      const user = await repository.adminCreateUser(data);
       res.status(201).json({ user });
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
 
-  app.put('/api/admin/users/:id', requireAdmin, (req: AuthRequest, res) => {
+  app.put('/api/admin/users/:id', requireAdmin, async (req: AuthRequest, res) => {
     try {
       const schema = z.object({
         fullName: z.string().min(2).max(120).optional(),
@@ -223,33 +234,33 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         isAdmin: z.boolean().optional(),
       });
       const data = schema.parse(req.body);
-      const user = repository.adminUpdateUser(req.params.id, data);
+      const user = await repository.adminUpdateUser(req.params.id, data);
       res.json({ user });
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
 
-  app.post('/api/admin/users/:id/reset-password', requireAdmin, (req: AuthRequest, res) => {
+  app.post('/api/admin/users/:id/reset-password', requireAdmin, async (req: AuthRequest, res) => {
     try {
       const schema = z.object({
         password: z.string().min(8, 'Password must be at least 8 characters'),
       });
       const data = schema.parse(req.body);
-      repository.adminResetPassword(req.params.id, data.password);
+      await repository.adminResetPassword(req.params.id, data.password);
       res.json({ success: true });
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
 
-  app.delete('/api/admin/users/:id', requireAdmin, (req: AuthRequest, res) => {
+  app.delete('/api/admin/users/:id', requireAdmin, async (req: AuthRequest, res) => {
     try {
       if (req.params.id === req.authUser!.userId) {
         res.status(400).json({ error: 'You cannot delete your own active administrator account.' });
         return;
       }
-      repository.adminDeleteUser(req.params.id);
+      await repository.adminDeleteUser(req.params.id);
       res.json({ success: true });
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
@@ -257,8 +268,8 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
   });
 
   // --- Authenticated Workspace Bundle ---
-  app.get('/api/workspace', requireAuth, (req: AuthRequest, res) => {
-    const bundle = repository.getWorkspaceBundle(req.authUser!.userId);
+  app.get('/api/workspace', requireAuth, async (req: AuthRequest, res) => {
+    const bundle = await repository.getWorkspaceBundle(req.authUser!.userId);
     if (!bundle) {
       res.status(404).json({ error: 'User workspace not found.' });
       return;

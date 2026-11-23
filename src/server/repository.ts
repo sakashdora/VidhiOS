@@ -70,19 +70,40 @@ class WorkspaceRepository {
   private state: StoreState;
   private writeQueue: Promise<void> = Promise.resolve();
   public readonly engine: 'neon' | 'supabase' | 'local_durable';
+  public readyPromise: Promise<void> | null = null;
 
   constructor() {
     this.state = this.loadState();
     if (isNeonConfigured()) {
       this.engine = 'neon';
-      this.initNeonAsync();
+      this.readyPromise = this.initNeonAsync();
     } else if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
       this.engine = 'supabase';
+      this.readyPromise = Promise.resolve();
     } else {
       this.engine = 'local_durable';
+      this.readyPromise = Promise.resolve();
     }
     this.ensureDemoAccount();
     this.ensureDefaultAdminAccount();
+  }
+
+  public async ensureReady(forceReload = false): Promise<void> {
+    if (this.readyPromise) {
+      await this.readyPromise;
+    }
+    if (this.engine === 'neon' && forceReload) {
+      try {
+        const remote = await loadStoreFromNeon();
+        if (remote && remote.users.length > 0) {
+          this.state = remote;
+          this.ensureDemoAccount();
+          this.ensureDefaultAdminAccount();
+        }
+      } catch (err) {
+        console.error('[Neon] Background reload error:', err);
+      }
+    }
   }
 
   private async initNeonAsync(): Promise<void> {
@@ -130,7 +151,7 @@ class WorkspaceRepository {
     return structuredClone(EMPTY_STATE);
   }
 
-  private persist(): void {
+  public async persist(): Promise<void> {
     const snapshot = JSON.stringify(this.state, null, 2);
     this.writeQueue = this.writeQueue
       .then(async () => {
@@ -143,7 +164,7 @@ class WorkspaceRepository {
           // Non-fatal on serverless read-only filesystems (Netlify/Vercel Lambda)
         }
         if (this.engine === 'neon') {
-          persistStoreToNeon(this.state).catch((e) =>
+          await persistStoreToNeon(this.state).catch((e) =>
             console.error('[Neon] Auto-persist error:', e)
           );
         }
@@ -151,6 +172,7 @@ class WorkspaceRepository {
       .catch((err) => {
         console.error('Failed to persist store:', err);
       });
+    await this.writeQueue;
   }
 
   private toPublicUser(u: StoredUser): UserProfile {
@@ -241,14 +263,15 @@ class WorkspaceRepository {
     return this.toPublicUser(this.ensureDemoAccount());
   }
 
-  public registerUser(input: {
+  public async registerUser(input: {
     email: string;
     password: string;
     fullName: string;
     organization?: string;
     role?: string;
     defaultJurisdiction?: JurisdictionMode;
-  }): UserProfile {
+  }): Promise<UserProfile> {
+    await this.ensureReady();
     const normalizedEmail = input.email.trim().toLowerCase();
     if (this.state.users.some((u) => u.email === normalizedEmail)) {
       throw new Error('An account with this email already exists.');
@@ -266,20 +289,30 @@ class WorkspaceRepository {
     };
     this.state.users.push(user);
     this.seedForUser(user.id);
-    this.persist();
+    await this.persist();
     return this.toPublicUser(user);
   }
 
-  public authenticateUser(email: string, password: string): UserProfile | null {
+  public async authenticateUser(email: string, password: string): Promise<UserProfile | null> {
+    await this.ensureReady();
     const normalizedEmail = email.trim().toLowerCase();
-    const user = this.state.users.find((u) => u.email === normalizedEmail);
+    let user = this.state.users.find((u) => u.email === normalizedEmail);
+    if (!user && this.engine === 'neon') {
+      await this.ensureReady(true);
+      user = this.state.users.find((u) => u.email === normalizedEmail);
+    }
     if (!user) return null;
     if (!verifyPassword(password, user.passwordHash)) return null;
     return this.toPublicUser(user);
   }
 
-  public getUserById(userId: string): UserProfile | null {
-    const user = this.state.users.find((u) => u.id === userId);
+  public async getUserById(userId: string): Promise<UserProfile | null> {
+    await this.ensureReady();
+    let user = this.state.users.find((u) => u.id === userId);
+    if (!user && this.engine === 'neon') {
+      await this.ensureReady(true);
+      user = this.state.users.find((u) => u.id === userId);
+    }
     return user ? this.toPublicUser(user) : null;
   }
 
@@ -292,7 +325,7 @@ class WorkspaceRepository {
     }));
   }
 
-  public adminCreateUser(input: {
+  public async adminCreateUser(input: {
     email: string;
     password: string;
     fullName: string;
@@ -300,7 +333,8 @@ class WorkspaceRepository {
     role?: string;
     defaultJurisdiction?: JurisdictionMode;
     isAdmin?: boolean;
-  }): UserProfile {
+  }): Promise<UserProfile> {
+    await this.ensureReady();
     const normalizedEmail = input.email.trim().toLowerCase();
     if (this.state.users.some((u) => u.email === normalizedEmail)) {
       throw new Error('An account with this email already exists.');
@@ -318,11 +352,11 @@ class WorkspaceRepository {
       createdAt: new Date().toISOString(),
     };
     this.state.users.push(user);
-    this.persist();
+    await this.persist();
     return this.toPublicUser(user);
   }
 
-  public adminUpdateUser(
+  public async adminUpdateUser(
     userId: string,
     input: {
       fullName?: string;
@@ -331,7 +365,8 @@ class WorkspaceRepository {
       defaultJurisdiction?: JurisdictionMode;
       isAdmin?: boolean;
     }
-  ): UserProfile {
+  ): Promise<UserProfile> {
+    await this.ensureReady();
     const user = this.state.users.find((u) => u.id === userId);
     if (!user) {
       throw new Error('User not found.');
@@ -341,11 +376,12 @@ class WorkspaceRepository {
     if (input.role !== undefined) user.role = input.role.trim();
     if (input.defaultJurisdiction !== undefined) user.defaultJurisdiction = input.defaultJurisdiction;
     if (input.isAdmin !== undefined) user.isAdmin = Boolean(input.isAdmin);
-    this.persist();
+    await this.persist();
     return this.toPublicUser(user);
   }
 
-  public adminResetPassword(userId: string, newPassword: string): void {
+  public async adminResetPassword(userId: string, newPassword: string): Promise<void> {
+    await this.ensureReady();
     const user = this.state.users.find((u) => u.id === userId);
     if (!user) {
       throw new Error('User not found.');
@@ -354,10 +390,11 @@ class WorkspaceRepository {
       throw new Error('Password must be at least 8 characters.');
     }
     user.passwordHash = hashPassword(newPassword);
-    this.persist();
+    await this.persist();
   }
 
-  public adminDeleteUser(userId: string): void {
+  public async adminDeleteUser(userId: string): Promise<void> {
+    await this.ensureReady();
     const index = this.state.users.findIndex((u) => u.id === userId);
     if (index === -1) {
       throw new Error('User not found.');
@@ -372,14 +409,19 @@ class WorkspaceRepository {
     this.state.trackedCases = this.state.trackedCases.filter((t) => t.userId !== userId);
     this.state.deadlines = this.state.deadlines.filter((d) => d.userId !== userId);
     this.state.assistantMessages = this.state.assistantMessages.filter((a) => a.userId !== userId);
-    this.persist();
+    await this.persist();
   }
 
-  public getWorkspaceBundle(userId: string): WorkspaceBundle | null {
-    const user = this.getUserById(userId);
+  public async getWorkspaceBundle(userId: string): Promise<WorkspaceBundle | null> {
+    await this.ensureReady();
+    let user = this.state.users.find((u) => u.id === userId);
+    if (!user && this.engine === 'neon') {
+      await this.ensureReady(true);
+      user = this.state.users.find((u) => u.id === userId);
+    }
     if (!user) return null;
     return {
-      user,
+      user: this.toPublicUser(user),
       matters: this.state.matters
         .filter((m) => m.userId === userId)
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),

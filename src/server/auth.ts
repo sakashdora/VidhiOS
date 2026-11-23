@@ -1,11 +1,13 @@
 import crypto from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
 
-// Server-only session signing secret (reads process.env or generates ephemeral CSPRNG key in memory)
+// Server session signing secret: persistent across Lambda/serverless cold starts
 const SESSION_SECRET =
   process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 16
     ? process.env.SESSION_SECRET
-    : crypto.randomBytes(32).toString('hex');
+    : process.env.DATABASE_URL
+    ? crypto.createHash('sha256').update(process.env.DATABASE_URL).digest('hex')
+    : 'vidhios-secure-session-signing-secret-2026-chambers-token-auth';
 
 const TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 7; // 7 days
 
