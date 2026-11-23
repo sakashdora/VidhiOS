@@ -94,6 +94,21 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
     next();
   });
 
+  // Support serverless environments (Vercel, AWS Lambda) where request body is pre-parsed
+  app.use((req, _res, next) => {
+    if (req.body && typeof req.body === 'object' && !(req as any)._body) {
+      (req as any)._body = true;
+    }
+    // Route normalization for Vercel rewrites
+    const matchedPath = (req.headers['x-matched-path'] || req.headers['x-forwarded-uri'] || '') as string;
+    if (matchedPath && matchedPath.startsWith('/api') && (req.url === '/api' || req.url === '/api/')) {
+      req.url = matchedPath;
+    } else if (req.url && !req.url.startsWith('/api')) {
+      req.url = '/api' + (req.url.startsWith('/') ? req.url : '/' + req.url);
+    }
+    next();
+  });
+
   app.use(express.json({ limit: '20mb' }));
 
   // Basic security headers aligned with Cloudflare & Vercel production config
@@ -1595,6 +1610,15 @@ Recommended Next Filings: ${analysis.recommendedFilings.map((f) => f.title).join
       });
     }
   }
+
+  // Global error handler ensuring JSON errors and logging on serverless platforms
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error('[VidhiOS Express Error]:', err);
+    if (res.headersSent) return;
+    res.status(err.status || err.statusCode || 500).json({
+      error: err.message || 'Internal server error occurred.',
+    });
+  });
 
   return app;
 }
