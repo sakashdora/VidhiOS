@@ -84,14 +84,6 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
   const app = express();
   app.disable('x-powered-by');
 
-  // Strip Netlify Functions prefix if present
-  app.use((req, _res, next) => {
-    if (req.url.startsWith('/.netlify/functions/api')) {
-      req.url = req.url.replace('/.netlify/functions/api', '/api');
-    }
-    next();
-  });
-
   // Ensure repository is connected and ready before handling requests
   app.use(async (_req, _res, next) => {
     try {
