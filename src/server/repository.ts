@@ -134,10 +134,14 @@ class WorkspaceRepository {
     const snapshot = JSON.stringify(this.state, null, 2);
     this.writeQueue = this.writeQueue
       .then(async () => {
-        await fs.promises.mkdir(DATA_DIR, { recursive: true });
-        const tmpPath = `${STORE_PATH}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-        await fs.promises.writeFile(tmpPath, snapshot, 'utf8');
-        await fs.promises.rename(tmpPath, STORE_PATH);
+        try {
+          await fs.promises.mkdir(DATA_DIR, { recursive: true });
+          const tmpPath = `${STORE_PATH}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+          await fs.promises.writeFile(tmpPath, snapshot, 'utf8');
+          await fs.promises.rename(tmpPath, STORE_PATH);
+        } catch {
+          // Non-fatal on serverless read-only filesystems (Netlify/Vercel Lambda)
+        }
         if (this.engine === 'neon') {
           persistStoreToNeon(this.state).catch((e) =>
             console.error('[Neon] Auto-persist error:', e)

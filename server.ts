@@ -3,7 +3,6 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { createServer as createViteServer } from 'vite';
 import { requireAuth, signSessionToken, type AuthRequest } from './src/server/auth';
 import { repository } from './src/server/repository';
 import { isNeonConfigured, testNeonConnection } from './src/server/neonDatabase';
@@ -84,9 +83,19 @@ function extractErrorMessage(err: unknown): string {
   return 'Unexpected server error';
 }
 
-async function startServer(): Promise<void> {
+export async function createExpressApp(options: { includeStatic?: boolean } = {}): Promise<express.Express> {
+  const includeStatic = options.includeStatic ?? true;
   const app = express();
   app.disable('x-powered-by');
+
+  // Strip Netlify Functions prefix if present
+  app.use((req, _res, next) => {
+    if (req.url.startsWith('/.netlify/functions/api')) {
+      req.url = req.url.replace('/.netlify/functions/api', '/api');
+    }
+    next();
+  });
+
   app.use(express.json({ limit: '20mb' }));
 
   // Basic security headers aligned with Cloudflare & Vercel production config
@@ -1569,26 +1578,45 @@ Recommended Next Filings: ${analysis.recommendedFilings.map((f) => f.title).join
   });
 
   // --- Frontend Mounting (Vite Dev Middleware or Production Static) ---
-  if (!IS_PROD) {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+  if (includeStatic) {
+    if (!IS_PROD) {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.resolve(__dirname, 'dist');
+      app.use(express.static(distPath));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    }
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`VidhiOS server listening on http://0.0.0.0:${PORT}`);
-  });
+  return app;
 }
 
-startServer().catch((err) => {
-  console.error('Fatal server startup error:', err);
-  process.exit(1);
-});
+// Standalone runner for local development and Docker containers
+const isDirectRun =
+  !process.env.NETLIFY &&
+  Boolean(
+    process.argv[1] &&
+      (process.argv[1].endsWith('server.ts') ||
+        process.argv[1].endsWith('server.js') ||
+        process.argv[1].includes('tsx'))
+  );
+
+if (isDirectRun) {
+  createExpressApp({ includeStatic: true })
+    .then((app) => {
+      app.listen(PORT, '0.0.0.0', () => {
+        console.log(`VidhiOS server listening on http://0.0.0.0:${PORT}`);
+      });
+    })
+    .catch((err) => {
+      console.error('Fatal server startup error:', err);
+      process.exit(1);
+    });
+}
