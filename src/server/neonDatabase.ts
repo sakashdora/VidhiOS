@@ -56,10 +56,14 @@ export function isNeonConfigured(): boolean {
  */
 async function resolveHostViaDoH(hostname: string): Promise<string | null> {
   if (resolvedHostIp) return resolvedHostIp;
+  // Cloud serverless runtimes (Netlify, Vercel, AWS Lambda) resolve AWS hostnames natively without UDP port 53 refusal
+  if (process.env.NETLIFY || process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.NODE_ENV === 'production') {
+    return null;
+  }
   try {
     const res = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=A`, {
       headers: { Accept: 'application/dns-json' },
-      signal: AbortSignal.timeout(3500),
+      signal: AbortSignal.timeout(2000),
     });
     if (!res.ok) return null;
     const json = (await res.json()) as { Answer?: Array<{ type: number; data: string }> };
@@ -152,10 +156,13 @@ export async function testNeonConnection(): Promise<{
   }
 }
 
+let schemaInitialized = false;
+
 /**
  * Automatically provisions all required VidhiOS tables in Neon PostgreSQL.
  */
-export async function initNeonSchema(): Promise<void> {
+export async function initNeonSchema(force = false): Promise<void> {
+  if (schemaInitialized && !force) return;
   const pool = await getNeonPool();
   if (!pool) return;
 
@@ -321,6 +328,7 @@ export async function initNeonSchema(): Promise<void> {
     `);
 
     console.log('[Neon PostgreSQL] Schema successfully verified & provisioned in neondb.');
+    schemaInitialized = true;
   } catch (err) {
     console.error('[Neon PostgreSQL] Schema verification error:', err);
   } finally {
@@ -335,9 +343,7 @@ export async function loadStoreFromNeon(): Promise<StoreState | null> {
   const pool = await getNeonPool();
   if (!pool) return null;
 
-  let client: PoolClient | null = null;
   try {
-    client = await pool.connect();
     const [
       users,
       matters,
@@ -350,16 +356,16 @@ export async function loadStoreFromNeon(): Promise<StoreState | null> {
       deadlines,
       assistantMsgs,
     ] = await Promise.all([
-      client.query('SELECT * FROM users;'),
-      client.query('SELECT * FROM matters;'),
-      client.query('SELECT * FROM research_memos;'),
-      client.query('SELECT * FROM drafts;'),
-      client.query('SELECT * FROM vault_documents;'),
-      client.query('SELECT * FROM contract_reviews;'),
-      client.query('SELECT * FROM courtroom_sessions;'),
-      client.query('SELECT * FROM tracked_cases;'),
-      client.query('SELECT * FROM deadlines;'),
-      client.query('SELECT * FROM assistant_messages ORDER BY created_at ASC;'),
+      pool.query('SELECT * FROM users;'),
+      pool.query('SELECT * FROM matters;'),
+      pool.query('SELECT * FROM research_memos;'),
+      pool.query('SELECT * FROM drafts;'),
+      pool.query('SELECT * FROM vault_documents;'),
+      pool.query('SELECT * FROM contract_reviews;'),
+      pool.query('SELECT * FROM courtroom_sessions;'),
+      pool.query('SELECT * FROM tracked_cases;'),
+      pool.query('SELECT * FROM deadlines;'),
+      pool.query('SELECT * FROM assistant_messages ORDER BY created_at ASC;'),
     ]);
 
     // If Neon database is completely blank, return null so local state can seed it
@@ -500,8 +506,6 @@ export async function loadStoreFromNeon(): Promise<StoreState | null> {
   } catch (err) {
     console.error('[Neon PostgreSQL] Failed to load store from Neon database:', err);
     return null;
-  } finally {
-    client?.release();
   }
 }
 
