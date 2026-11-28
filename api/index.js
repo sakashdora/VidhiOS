@@ -965,10 +965,89 @@ async function persistStoreToNeon(state) {
         [dl.id, dl.matterId, dl.userId, dl.title, dl.statuteArticle || "", dl.triggerDate, dl.dueDate, dl.graceDate || null, dl.completed, dl.notes || "", dl.createdAt]
       );
     }
+    for (const cr of state.contractReviews) {
+      await client.query(
+        `INSERT INTO contract_reviews (id, matter_id, user_id, title, playbook, source_text, summary, clauses, requisitions, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (id) DO UPDATE SET
+           clauses = EXCLUDED.clauses,
+           summary = EXCLUDED.summary;`,
+        [cr.id, cr.matterId, cr.userId, cr.title, cr.playbook, cr.sourceText, cr.summary, JSON.stringify(cr.clauses), JSON.stringify(cr.requisitions), cr.createdAt]
+      );
+    }
+    for (const cs of state.courtroomSessions) {
+      await client.query(
+        `INSERT INTO courtroom_sessions (id, matter_id, user_id, mode, forum_context, brief_excerpt, turns, vulnerabilities, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (id) DO UPDATE SET
+           turns = EXCLUDED.turns,
+           vulnerabilities = EXCLUDED.vulnerabilities;`,
+        [cs.id, cs.matterId, cs.userId, cs.mode, cs.forumContext, cs.briefExcerpt, JSON.stringify(cs.turns), JSON.stringify(cs.vulnerabilities), cs.createdAt]
+      );
+    }
+    for (const tc of state.trackedCases) {
+      await client.query(
+        `INSERT INTO tracked_cases (id, matter_id, user_id, case_number, court, courtroom, bench, cause_list_item, next_hearing_date, stage, notes, cnr_number, status, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+         ON CONFLICT (id) DO UPDATE SET
+           status = EXCLUDED.status,
+           next_hearing_date = EXCLUDED.next_hearing_date,
+           stage = EXCLUDED.stage,
+           notes = EXCLUDED.notes,
+           updated_at = EXCLUDED.updated_at;`,
+        [tc.id, tc.matterId, tc.userId, tc.caseNumber, tc.court, tc.courtroom || "", tc.bench || "", tc.causeListItem || "", tc.nextHearingDate, tc.stage, tc.notes || "", tc.cnrNumber || "", tc.status, tc.createdAt, tc.createdAt]
+      );
+    }
+    for (const am of state.assistantMessages) {
+      await client.query(
+        `INSERT INTO assistant_messages (id, user_id, matter_id, role, content, language_used, verification_mode, confidence_note, sources, completed_actions, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (id) DO NOTHING;`,
+        [am.id, am.userId, am.matterId, am.role, am.content, am.languageUsed, am.verificationMode, am.confidenceNote || "", JSON.stringify(am.sources), JSON.stringify(am.completedActions), am.createdAt]
+      );
+    }
   } catch (err) {
     console.error("[Neon PostgreSQL] Failed to sync store snapshot:", err);
   } finally {
     client?.release();
+  }
+}
+async function deleteUserFromNeon(userId) {
+  const pool = await getNeonPool();
+  if (!pool) return;
+  try {
+    await Promise.all([
+      pool.query("DELETE FROM assistant_messages WHERE user_id = $1;", [userId]),
+      pool.query("DELETE FROM deadlines WHERE user_id = $1;", [userId]),
+      pool.query("DELETE FROM tracked_cases WHERE user_id = $1;", [userId]),
+      pool.query("DELETE FROM courtroom_sessions WHERE user_id = $1;", [userId]),
+      pool.query("DELETE FROM contract_reviews WHERE user_id = $1;", [userId]),
+      pool.query("DELETE FROM vault_documents WHERE user_id = $1;", [userId]),
+      pool.query("DELETE FROM research_memos WHERE user_id = $1;", [userId]),
+      pool.query("DELETE FROM drafts WHERE user_id = $1;", [userId]),
+      pool.query("DELETE FROM matters WHERE user_id = $1;", [userId]),
+      pool.query("DELETE FROM users WHERE id = $1;", [userId])
+    ]);
+  } catch (err) {
+    console.error("[Neon PostgreSQL] Failed to delete user:", err);
+  }
+}
+async function deleteMatterFromNeon(matterId) {
+  const pool = await getNeonPool();
+  if (!pool) return;
+  try {
+    await Promise.all([
+      pool.query("DELETE FROM deadlines WHERE matter_id = $1;", [matterId]),
+      pool.query("DELETE FROM tracked_cases WHERE matter_id = $1;", [matterId]),
+      pool.query("DELETE FROM courtroom_sessions WHERE matter_id = $1;", [matterId]),
+      pool.query("DELETE FROM contract_reviews WHERE matter_id = $1;", [matterId]),
+      pool.query("DELETE FROM vault_documents WHERE matter_id = $1;", [matterId]),
+      pool.query("DELETE FROM research_memos WHERE matter_id = $1;", [matterId]),
+      pool.query("DELETE FROM drafts WHERE matter_id = $1;", [matterId]),
+      pool.query("DELETE FROM matters WHERE id = $1;", [matterId])
+    ]);
+  } catch (err) {
+    console.error("[Neon PostgreSQL] Failed to delete matter:", err);
   }
 }
 
@@ -1000,12 +1079,14 @@ var WorkspaceRepository = class {
     } else if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
       this.engine = "supabase";
       this.readyPromise = Promise.resolve();
+      this.ensureDemoAccount();
+      this.ensureDefaultAdminAccount();
     } else {
       this.engine = "local_durable";
       this.readyPromise = Promise.resolve();
+      this.ensureDemoAccount();
+      this.ensureDefaultAdminAccount();
     }
-    this.ensureDemoAccount();
-    this.ensureDefaultAdminAccount();
   }
   async ensureReady(forceReload = false) {
     if (this.readyPromise) {
@@ -1034,6 +1115,7 @@ var WorkspaceRepository = class {
         this.ensureDefaultAdminAccount();
         console.log("[Neon] Repository synchronized with remote Neon PostgreSQL.");
       } else {
+        this.ensureDemoAccount();
         this.ensureDefaultAdminAccount();
         await persistStoreToNeon(this.state);
         console.log("[Neon] Initialized remote Neon PostgreSQL with chamber records.");
@@ -1281,6 +1363,9 @@ var WorkspaceRepository = class {
     this.state.trackedCases = this.state.trackedCases.filter((t) => t.userId !== userId);
     this.state.deadlines = this.state.deadlines.filter((d) => d.userId !== userId);
     this.state.assistantMessages = this.state.assistantMessages.filter((a) => a.userId !== userId);
+    if (this.engine === "neon") {
+      await deleteUserFromNeon(userId);
+    }
     await this.persist();
   }
   async getWorkspaceBundle(userId) {
@@ -1335,6 +1420,9 @@ var WorkspaceRepository = class {
     this.state.trackedCases = this.state.trackedCases.filter((tc) => tc.matterId !== matterId);
     this.state.deadlines = this.state.deadlines.filter((dl) => dl.matterId !== matterId);
     this.state.meetingBriefs = this.state.meetingBriefs.filter((mb) => mb.matterId !== matterId);
+    if (this.engine === "neon") {
+      void deleteMatterFromNeon(matterId);
+    }
     this.persist();
     return true;
   }
@@ -5200,7 +5288,8 @@ async function createExpressApp(options = {}) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
-  app.post("/api/auth/demo", (_req, res) => {
+  app.post("/api/auth/demo", async (_req, res) => {
+    await repository.ensureReady();
     const user = repository.getDemoUser();
     const token = signSessionToken(user.id, user.email);
     res.json({ token, user });
@@ -5218,8 +5307,9 @@ async function createExpressApp(options = {}) {
       next();
     });
   };
-  app.get("/api/admin/users", requireAdmin, (_req, res) => {
+  app.get("/api/admin/users", requireAdmin, async (_req, res) => {
     try {
+      await repository.ensureReady(repository.engine === "neon");
       const users = repository.getAllUsers();
       res.json({ users });
     } catch (err) {
@@ -5301,7 +5391,7 @@ async function createExpressApp(options = {}) {
       }
     });
   });
-  app.post("/api/matters", requireAuth, (req, res) => {
+  app.post("/api/matters", requireAuth, async (req, res) => {
     try {
       const schema = z.object({
         title: z.string().min(3).max(200),
@@ -5315,20 +5405,22 @@ async function createExpressApp(options = {}) {
       });
       const data = schema.parse(req.body);
       const matter = repository.createMatter(req.authUser.userId, data);
+      await repository.persist();
       res.status(201).json(matter);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
-  app.delete("/api/matters/:id", requireAuth, (req, res) => {
+  app.delete("/api/matters/:id", requireAuth, async (req, res) => {
     const deleted = repository.deleteMatter(req.authUser.userId, String(req.params.id));
     if (!deleted) {
       res.status(404).json({ error: "Matter not found." });
       return;
     }
+    await repository.persist();
     res.json({ deleted: true });
   });
-  app.post("/api/drafts", requireAuth, (req, res) => {
+  app.post("/api/drafts", requireAuth, async (req, res) => {
     try {
       const schema = z.object({
         matterId: z.string().min(1),
@@ -5342,12 +5434,13 @@ async function createExpressApp(options = {}) {
         return;
       }
       const draft = repository.createDraft(req.authUser.userId, data);
+      await repository.persist();
       res.status(201).json(draft);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
-  app.patch("/api/drafts/:id", requireAuth, (req, res) => {
+  app.patch("/api/drafts/:id", requireAuth, async (req, res) => {
     try {
       const schema = z.object({
         title: z.string().min(2).max(200).optional(),
@@ -5359,12 +5452,13 @@ async function createExpressApp(options = {}) {
         res.status(404).json({ error: "Draft not found." });
         return;
       }
+      await repository.persist();
       res.json(updated);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
-  app.patch("/api/contract-reviews/:reviewId/clauses/:clauseId", requireAuth, (req, res) => {
+  app.patch("/api/contract-reviews/:reviewId/clauses/:clauseId", requireAuth, async (req, res) => {
     try {
       const schema = z.object({
         decision: z.enum(["pending", "accepted", "rejected"])
@@ -5380,12 +5474,13 @@ async function createExpressApp(options = {}) {
         res.status(404).json({ error: "Contract review or clause not found." });
         return;
       }
+      await repository.persist();
       res.json(updated);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
-  app.post("/api/cases", requireAuth, (req, res) => {
+  app.post("/api/cases", requireAuth, async (req, res) => {
     try {
       const schema = z.object({
         matterId: z.string().min(1),
@@ -5406,12 +5501,13 @@ async function createExpressApp(options = {}) {
         return;
       }
       const created = repository.addTrackedCase({ ...data, userId: req.authUser.userId });
+      await repository.persist();
       res.status(201).json(created);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
-  app.patch("/api/cases/:id", requireAuth, (req, res) => {
+  app.patch("/api/cases/:id", requireAuth, async (req, res) => {
     try {
       const schema = z.object({
         status: z.enum(["listed", "in_session", "adjourned", "disposed"])
@@ -5426,12 +5522,13 @@ async function createExpressApp(options = {}) {
         res.status(404).json({ error: "Tracked case not found." });
         return;
       }
+      await repository.persist();
       res.json(updated);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
-  app.post("/api/deadlines", requireAuth, (req, res) => {
+  app.post("/api/deadlines", requireAuth, async (req, res) => {
     try {
       const schema = z.object({
         matterId: z.string().min(1),
@@ -5452,17 +5549,19 @@ async function createExpressApp(options = {}) {
         userId: req.authUser.userId,
         completed: false
       });
+      await repository.persist();
       res.status(201).json(created);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
-  app.patch("/api/deadlines/:id/toggle", requireAuth, (req, res) => {
+  app.patch("/api/deadlines/:id/toggle", requireAuth, async (req, res) => {
     const updated = repository.toggleDeadline(req.authUser.userId, String(req.params.id));
     if (!updated) {
       res.status(404).json({ error: "Deadline not found." });
       return;
     }
+    await repository.persist();
     res.json(updated);
   });
   app.post("/api/whatsapp/command", requireAuth, async (req, res) => {
@@ -5473,7 +5572,7 @@ async function createExpressApp(options = {}) {
       });
       const { matterId, text } = schema.parse(req.body);
       const userId = req.authUser.userId;
-      const bundle = repository.getWorkspaceBundle(userId);
+      const bundle = await repository.getWorkspaceBundle(userId);
       if (!bundle) {
         res.status(404).json({ error: "Workspace not found." });
         return;
@@ -5781,7 +5880,7 @@ Facts: ${matter.summaryFacts}`;
       });
       const { submission } = schema.parse(req.body);
       const userId = req.authUser.userId;
-      const bundle = repository.getWorkspaceBundle(userId);
+      const bundle = await repository.getWorkspaceBundle(userId);
       const session = bundle?.courtroomSessions.find((s) => s.id === String(req.params.sessionId));
       if (!session) {
         res.status(404).json({ error: "Courtroom session not found." });
@@ -5881,7 +5980,7 @@ Facts: ${matter.summaryFacts}`;
         res.status(404).json({ error: "Matter not found." });
         return;
       }
-      const bundle = repository.getWorkspaceBundle(userId);
+      const bundle = await repository.getWorkspaceBundle(userId);
       const existingDocsContext = (bundle?.vaultDocuments ?? []).filter((d) => d.matterId === matter.id).map((d) => `[${d.fileName}]: ${d.extractedText.slice(0, 2e3)}`).join("\n\n");
       const result = await processVaultDocument({
         fileName: data.fileName,
@@ -5976,7 +6075,7 @@ Facts: ${matter.summaryFacts}`;
         res.status(404).json({ error: "Matter not found." });
         return;
       }
-      const bundle = repository.getWorkspaceBundle(userId);
+      const bundle = await repository.getWorkspaceBundle(userId);
       const vaultSummary = (bundle?.vaultDocuments ?? []).filter((d) => d.matterId === matter.id).slice(0, 4).map((d) => `[${d.fileName}]: ${d.extractedText.slice(0, 800)}`).join("\n");
       const docketSummary = (bundle?.trackedCases ?? []).filter((c) => c.matterId === matter.id).map((c) => `${c.caseNumber} (${c.court}) \u2014 Next: ${c.nextHearingDate}, Stage: ${c.stage}`).join("\n");
       const deadlineSummary = (bundle?.deadlines ?? []).filter((dl) => dl.matterId === matter.id && !dl.completed).map((dl) => `${dl.title} \u2014 Due ${dl.dueDate} (${dl.statuteArticle})`).join("\n");
@@ -6221,7 +6320,7 @@ data: ${JSON.stringify({ error: extractErrorMessage(err) })}
       });
       const data = schema.parse(req.body);
       const userId = req.authUser.userId;
-      const bundle = repository.getWorkspaceBundle(userId);
+      const bundle = await repository.getWorkspaceBundle(userId);
       if (!bundle) {
         res.status(404).json({ error: "Workspace not found." });
         return;
@@ -6485,6 +6584,7 @@ Facts: ${activeMatter.summaryFacts}` : "No active matter selected.";
         sources,
         completedActions
       });
+      await repository.persist();
       res.status(201).json({
         userMsg,
         assistantMsg,
@@ -6495,8 +6595,9 @@ Facts: ${activeMatter.summaryFacts}` : "No active matter selected.";
       res.status(500).json({ error: extractErrorMessage(err) });
     }
   });
-  app.delete("/api/ai/assistant", requireAuth, (req, res) => {
+  app.delete("/api/ai/assistant", requireAuth, async (req, res) => {
     repository.clearAssistantMessages(req.authUser.userId);
+    await repository.persist();
     res.json({ cleared: true });
   });
   if (includeStatic) {

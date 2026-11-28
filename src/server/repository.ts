@@ -23,6 +23,8 @@ import type {
 import { hashPassword, verifyPassword } from './auth';
 import { buildSeededWorkspace } from './seedData';
 import {
+  deleteMatterFromNeon,
+  deleteUserFromNeon,
   initNeonSchema,
   isNeonConfigured,
   loadStoreFromNeon,
@@ -80,12 +82,14 @@ class WorkspaceRepository {
     } else if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
       this.engine = 'supabase';
       this.readyPromise = Promise.resolve();
+      this.ensureDemoAccount();
+      this.ensureDefaultAdminAccount();
     } else {
       this.engine = 'local_durable';
       this.readyPromise = Promise.resolve();
+      this.ensureDemoAccount();
+      this.ensureDefaultAdminAccount();
     }
-    this.ensureDemoAccount();
-    this.ensureDefaultAdminAccount();
   }
 
   public async ensureReady(forceReload = false): Promise<void> {
@@ -116,6 +120,7 @@ class WorkspaceRepository {
         this.ensureDefaultAdminAccount();
         console.log('[Neon] Repository synchronized with remote Neon PostgreSQL.');
       } else {
+        this.ensureDemoAccount();
         this.ensureDefaultAdminAccount();
         await persistStoreToNeon(this.state);
         console.log('[Neon] Initialized remote Neon PostgreSQL with chamber records.');
@@ -409,6 +414,9 @@ class WorkspaceRepository {
     this.state.trackedCases = this.state.trackedCases.filter((t) => t.userId !== userId);
     this.state.deadlines = this.state.deadlines.filter((d) => d.userId !== userId);
     this.state.assistantMessages = this.state.assistantMessages.filter((a) => a.userId !== userId);
+    if (this.engine === 'neon') {
+      await deleteUserFromNeon(userId);
+    }
     await this.persist();
   }
 
@@ -492,6 +500,9 @@ class WorkspaceRepository {
     this.state.trackedCases = this.state.trackedCases.filter((tc) => tc.matterId !== matterId);
     this.state.deadlines = this.state.deadlines.filter((dl) => dl.matterId !== matterId);
     this.state.meetingBriefs = this.state.meetingBriefs.filter((mb) => mb.matterId !== matterId);
+    if (this.engine === 'neon') {
+      void deleteMatterFromNeon(matterId);
+    }
     this.persist();
     return true;
   }

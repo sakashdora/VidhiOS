@@ -39,16 +39,16 @@ const NAV_ITEMS: Array<{
   shortLabel: string;
   icon: React.ComponentType<{ className?: string; strokeWidth?: number }>;
 }> = [
-  { id: 'overview', label: 'Command Overview', shortLabel: 'Overview', icon: LayoutDashboard },
-  { id: 'assistant', label: 'VidhiOS Assistant', shortLabel: 'Assistant', icon: Bot },
-  { id: 'research', label: 'Legal Research', shortLabel: 'Research', icon: BookOpen },
-  { id: 'drafting', label: 'Drafting & Forms', shortLabel: 'Drafting', icon: FileEdit },
-  { id: 'courtroom', label: 'Courtroom Simulator', shortLabel: 'Courtroom', icon: Gavel },
-  { id: 'redline', label: 'Contract Redline & DD', shortLabel: 'Redline', icon: FileCheck2 },
-  { id: 'vault', label: 'Document Vault & OCR', shortLabel: 'Vault', icon: FolderSearch },
-  { id: 'cases', label: 'Cases & Limitation', shortLabel: 'Cases', icon: CalendarClock },
-  { id: 'admin', label: 'Admin Panel', shortLabel: 'Admin', icon: ShieldCheck },
-];
+    { id: 'overview', label: 'Command Overview', shortLabel: 'Overview', icon: LayoutDashboard },
+    { id: 'assistant', label: 'VidhiOS Assistant', shortLabel: 'Assistant', icon: Bot },
+    { id: 'research', label: 'Legal Research', shortLabel: 'Research', icon: BookOpen },
+    { id: 'drafting', label: 'Drafting & Forms', shortLabel: 'Drafting', icon: FileEdit },
+    { id: 'courtroom', label: 'Courtroom Simulator', shortLabel: 'Courtroom', icon: Gavel },
+    { id: 'redline', label: 'Contract Redline & DD', shortLabel: 'Redline', icon: FileCheck2 },
+    { id: 'vault', label: 'Document Vault & OCR', shortLabel: 'Vault', icon: FolderSearch },
+    { id: 'cases', label: 'Cases & Limitation', shortLabel: 'Cases', icon: CalendarClock },
+    { id: 'admin', label: 'Admin Panel', shortLabel: 'Admin', icon: ShieldCheck },
+  ];
 
 export default function App() {
   const [user, setUser] = useState<UserProfile | null>(null);
@@ -143,6 +143,7 @@ export default function App() {
     user?.isAdmin ||
     user?.role?.toLowerCase() === 'admin' ||
     user?.role?.toLowerCase() === 'administrator' ||
+    user?.email === 'vidhios@admin.com' ||
     user?.email === 'chambers@vidhios.in'
   );
 
@@ -219,11 +220,10 @@ export default function App() {
                 setActiveSection(item.id);
                 setMobileMenuOpen(false);
               }}
-              className={`w-full flex items-center gap-2.5 px-3.5 py-2.5 text-sm rounded-xl transition-all whitespace-nowrap ${
-                active
-                  ? 'bg-[#0f5a5f] dark:bg-[#14777e] text-[#faf8f4] font-semibold shadow-sm'
-                  : 'text-ink-secondary hover:bg-[#eae3d5] dark:hover:bg-[#1f2a2d] hover:text-ink font-medium'
-              }`}
+              className={`w-full flex items-center gap-2.5 px-3.5 py-2.5 text-sm rounded-xl transition-all whitespace-nowrap ${active
+                ? 'bg-[#0f5a5f] dark:bg-[#14777e] text-[#faf8f4] font-semibold shadow-sm'
+                : 'text-ink-secondary hover:bg-[#eae3d5] dark:hover:bg-[#1f2a2d] hover:text-ink font-medium'
+                }`}
             >
               <Icon className="w-4 h-4 shrink-0" strokeWidth={2} />
               <span className="truncate">{item.label}</span>
@@ -254,16 +254,14 @@ export default function App() {
             className="inline-flex items-center gap-2 text-xs font-medium text-ink-secondary hover:text-ink transition-colors"
           >
             <span
-              className={`relative inline-flex items-center w-12 h-6 rounded-full px-1 transition-colors ${
-                darkMode
-                  ? 'bg-[#14777e] justify-end'
-                  : 'neu-inset justify-start'
-              }`}
+              className={`relative inline-flex items-center w-12 h-6 rounded-full px-1 transition-colors ${darkMode
+                ? 'bg-[#14777e] justify-end'
+                : 'neu-inset justify-start'
+                }`}
             >
               <span
-                className={`text-[9px] font-mono font-bold absolute ${
-                  darkMode ? 'left-1.5 text-[#faf8f4]' : 'right-1.5 text-ink-muted'
-                }`}
+                className={`text-[9px] font-mono font-bold absolute ${darkMode ? 'left-1.5 text-[#faf8f4]' : 'right-1.5 text-ink-muted'
+                  }`}
               >
                 {darkMode ? 'ON' : 'OFF'}
               </span>
@@ -403,17 +401,17 @@ export default function App() {
                     setBundle((prev) =>
                       prev
                         ? {
-                            ...prev,
-                            assistantMessages: [
-                              ...(prev.assistantMessages ?? []),
-                              userMsg,
-                              assistantMsg,
-                            ],
-                            drafts: createdDraft ? [createdDraft, ...prev.drafts] : prev.drafts,
-                            deadlines: createdDeadline
-                              ? [...prev.deadlines, createdDeadline]
-                              : prev.deadlines,
-                          }
+                          ...prev,
+                          assistantMessages: [
+                            ...(prev.assistantMessages ?? []),
+                            userMsg,
+                            assistantMsg,
+                          ],
+                          drafts: createdDraft ? [createdDraft, ...prev.drafts] : prev.drafts,
+                          deadlines: createdDeadline
+                            ? [...prev.deadlines, createdDeadline]
+                            : prev.deadlines,
+                        }
                         : prev
                     )
                   }
@@ -453,9 +451,9 @@ export default function App() {
                     setBundle((prev) =>
                       prev
                         ? {
-                            ...prev,
-                            drafts: prev.drafts.map((d) => (d.id === draft.id ? draft : d)),
-                          }
+                          ...prev,
+                          drafts: prev.drafts.map((d) => (d.id === draft.id ? draft : d)),
+                        }
                         : prev
                     )
                   }
@@ -483,11 +481,11 @@ export default function App() {
                     setBundle((prev) =>
                       prev
                         ? {
-                            ...prev,
-                            courtroomSessions: prev.courtroomSessions.map((item) =>
-                              item.id === s.id ? s : item
-                            ),
-                          }
+                          ...prev,
+                          courtroomSessions: prev.courtroomSessions.map((item) =>
+                            item.id === s.id ? s : item
+                          ),
+                        }
                         : prev
                     )
                   }
@@ -508,11 +506,11 @@ export default function App() {
                     setBundle((prev) =>
                       prev
                         ? {
-                            ...prev,
-                            contractReviews: prev.contractReviews.map((item) =>
-                              item.id === r.id ? r : item
-                            ),
-                          }
+                          ...prev,
+                          contractReviews: prev.contractReviews.map((item) =>
+                            item.id === r.id ? r : item
+                          ),
+                        }
                         : prev
                     )
                   }
@@ -547,11 +545,11 @@ export default function App() {
                     setBundle((prev) =>
                       prev
                         ? {
-                            ...prev,
-                            trackedCases: prev.trackedCases.map((item) =>
-                              item.id === tc.id ? tc : item
-                            ),
-                          }
+                          ...prev,
+                          trackedCases: prev.trackedCases.map((item) =>
+                            item.id === tc.id ? tc : item
+                          ),
+                        }
                         : prev
                     )
                   }
@@ -564,11 +562,11 @@ export default function App() {
                     setBundle((prev) =>
                       prev
                         ? {
-                            ...prev,
-                            deadlines: prev.deadlines.map((item) =>
-                              item.id === dl.id ? dl : item
-                            ),
-                          }
+                          ...prev,
+                          deadlines: prev.deadlines.map((item) =>
+                            item.id === dl.id ? dl : item
+                          ),
+                        }
                         : prev
                     )
                   }

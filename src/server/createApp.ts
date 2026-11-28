@@ -174,7 +174,8 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
     }
   });
 
-  app.post('/api/auth/demo', (_req, res) => {
+  app.post('/api/auth/demo', async (_req, res) => {
+    await repository.ensureReady();
     const user = repository.getDemoUser();
     const token = signSessionToken(user.id, user.email);
     res.json({ token, user });
@@ -199,8 +200,9 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
     });
   };
 
-  app.get('/api/admin/users', requireAdmin, (_req: AuthRequest, res) => {
+  app.get('/api/admin/users', requireAdmin, async (_req: AuthRequest, res) => {
     try {
+      await repository.ensureReady(repository.engine === 'neon');
       const users = repository.getAllUsers();
       res.json({ users });
     } catch (err) {
@@ -290,7 +292,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
   });
 
   // --- Matters CRUD ---
-  app.post('/api/matters', requireAuth, (req: AuthRequest, res) => {
+  app.post('/api/matters', requireAuth, async (req: AuthRequest, res) => {
     try {
       const schema = z.object({
         title: z.string().min(3).max(200),
@@ -304,23 +306,25 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
       });
       const data = schema.parse(req.body);
       const matter = repository.createMatter(req.authUser!.userId, data);
+      await repository.persist();
       res.status(201).json(matter);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
 
-  app.delete('/api/matters/:id', requireAuth, (req: AuthRequest, res) => {
+  app.delete('/api/matters/:id', requireAuth, async (req: AuthRequest, res) => {
     const deleted = repository.deleteMatter(req.authUser!.userId, String(req.params.id));
     if (!deleted) {
       res.status(404).json({ error: 'Matter not found.' });
       return;
     }
+    await repository.persist();
     res.json({ deleted: true });
   });
 
   // --- Drafts CRUD ---
-  app.post('/api/drafts', requireAuth, (req: AuthRequest, res) => {
+  app.post('/api/drafts', requireAuth, async (req: AuthRequest, res) => {
     try {
       const schema = z.object({
         matterId: z.string().min(1),
@@ -334,13 +338,14 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         return;
       }
       const draft = repository.createDraft(req.authUser!.userId, data);
+      await repository.persist();
       res.status(201).json(draft);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
 
-  app.patch('/api/drafts/:id', requireAuth, (req: AuthRequest, res) => {
+  app.patch('/api/drafts/:id', requireAuth, async (req: AuthRequest, res) => {
     try {
       const schema = z.object({
         title: z.string().min(2).max(200).optional(),
@@ -352,6 +357,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         res.status(404).json({ error: 'Draft not found.' });
         return;
       }
+      await repository.persist();
       res.json(updated);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
@@ -359,7 +365,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
   });
 
   // --- Contract Redline Decision ---
-  app.patch('/api/contract-reviews/:reviewId/clauses/:clauseId', requireAuth, (req: AuthRequest, res) => {
+  app.patch('/api/contract-reviews/:reviewId/clauses/:clauseId', requireAuth, async (req: AuthRequest, res) => {
     try {
       const schema = z.object({
         decision: z.enum(['pending', 'accepted', 'rejected']),
@@ -375,6 +381,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         res.status(404).json({ error: 'Contract review or clause not found.' });
         return;
       }
+      await repository.persist();
       res.json(updated);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
@@ -382,7 +389,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
   });
 
   // --- Case Tracker & Deadlines ---
-  app.post('/api/cases', requireAuth, (req: AuthRequest, res) => {
+  app.post('/api/cases', requireAuth, async (req: AuthRequest, res) => {
     try {
       const schema = z.object({
         matterId: z.string().min(1),
@@ -403,13 +410,14 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         return;
       }
       const created = repository.addTrackedCase({ ...data, userId: req.authUser!.userId });
+      await repository.persist();
       res.status(201).json(created);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
 
-  app.patch('/api/cases/:id', requireAuth, (req: AuthRequest, res) => {
+  app.patch('/api/cases/:id', requireAuth, async (req: AuthRequest, res) => {
     try {
       const schema = z.object({
         status: z.enum(['listed', 'in_session', 'adjourned', 'disposed']),
@@ -424,13 +432,14 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         res.status(404).json({ error: 'Tracked case not found.' });
         return;
       }
+      await repository.persist();
       res.json(updated);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
 
-  app.post('/api/deadlines', requireAuth, (req: AuthRequest, res) => {
+  app.post('/api/deadlines', requireAuth, async (req: AuthRequest, res) => {
     try {
       const schema = z.object({
         matterId: z.string().min(1),
@@ -451,18 +460,20 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         userId: req.authUser!.userId,
         completed: false,
       });
+      await repository.persist();
       res.status(201).json(created);
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
 
-  app.patch('/api/deadlines/:id/toggle', requireAuth, (req: AuthRequest, res) => {
+  app.patch('/api/deadlines/:id/toggle', requireAuth, async (req: AuthRequest, res) => {
     const updated = repository.toggleDeadline(req.authUser!.userId, String(req.params.id));
     if (!updated) {
       res.status(404).json({ error: 'Deadline not found.' });
       return;
     }
+    await repository.persist();
     res.json(updated);
   });
 
@@ -475,7 +486,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
       });
       const { matterId, text } = schema.parse(req.body);
       const userId = req.authUser!.userId;
-      const bundle = repository.getWorkspaceBundle(userId);
+      const bundle = await repository.getWorkspaceBundle(userId);
       if (!bundle) {
         res.status(404).json({ error: 'Workspace not found.' });
         return;
@@ -804,7 +815,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
       });
       const { submission } = schema.parse(req.body);
       const userId = req.authUser!.userId;
-      const bundle = repository.getWorkspaceBundle(userId);
+      const bundle = await repository.getWorkspaceBundle(userId);
       const session = bundle?.courtroomSessions.find((s) => s.id === String(req.params.sessionId));
       if (!session) {
         res.status(404).json({ error: 'Courtroom session not found.' });
@@ -912,7 +923,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         return;
       }
 
-      const bundle = repository.getWorkspaceBundle(userId);
+      const bundle = await repository.getWorkspaceBundle(userId);
       const existingDocsContext = (bundle?.vaultDocuments ?? [])
         .filter((d) => d.matterId === matter.id)
         .map((d) => `[${d.fileName}]: ${d.extractedText.slice(0, 2000)}`)
@@ -1020,7 +1031,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         return;
       }
 
-      const bundle = repository.getWorkspaceBundle(userId);
+      const bundle = await repository.getWorkspaceBundle(userId);
       const vaultSummary = (bundle?.vaultDocuments ?? [])
         .filter((d) => d.matterId === matter.id)
         .slice(0, 4)
@@ -1281,7 +1292,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
       });
       const data = schema.parse(req.body);
       const userId = req.authUser!.userId;
-      const bundle = repository.getWorkspaceBundle(userId);
+      const bundle = await repository.getWorkspaceBundle(userId);
       if (!bundle) {
         res.status(404).json({ error: 'Workspace not found.' });
         return;
@@ -1575,6 +1586,7 @@ Recommended Next Filings: ${analysis.recommendedFilings.map((f) => f.title).join
         completedActions,
       });
 
+      await repository.persist();
       res.status(201).json({
         userMsg,
         assistantMsg,
@@ -1586,8 +1598,9 @@ Recommended Next Filings: ${analysis.recommendedFilings.map((f) => f.title).join
     }
   });
 
-  app.delete('/api/ai/assistant', requireAuth, (req: AuthRequest, res) => {
+  app.delete('/api/ai/assistant', requireAuth, async (req: AuthRequest, res) => {
     repository.clearAssistantMessages(req.authUser!.userId);
+    await repository.persist();
     res.json({ cleared: true });
   });
 

@@ -596,9 +596,98 @@ export async function persistStoreToNeon(state: StoreState): Promise<void> {
         [dl.id, dl.matterId, dl.userId, dl.title, dl.statuteArticle || '', dl.triggerDate, dl.dueDate, dl.graceDate || null, dl.completed, dl.notes || '', dl.createdAt]
       );
     }
+
+    // 7. Contract reviews upsert
+    for (const cr of state.contractReviews) {
+      await client.query(
+        `INSERT INTO contract_reviews (id, matter_id, user_id, title, playbook, source_text, summary, clauses, requisitions, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (id) DO UPDATE SET
+           clauses = EXCLUDED.clauses,
+           summary = EXCLUDED.summary;`,
+        [cr.id, cr.matterId, cr.userId, cr.title, cr.playbook, cr.sourceText, cr.summary, JSON.stringify(cr.clauses), JSON.stringify(cr.requisitions), cr.createdAt]
+      );
+    }
+
+    // 8. Courtroom sessions upsert
+    for (const cs of state.courtroomSessions) {
+      await client.query(
+        `INSERT INTO courtroom_sessions (id, matter_id, user_id, mode, forum_context, brief_excerpt, turns, vulnerabilities, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (id) DO UPDATE SET
+           turns = EXCLUDED.turns,
+           vulnerabilities = EXCLUDED.vulnerabilities;`,
+        [cs.id, cs.matterId, cs.userId, cs.mode, cs.forumContext, cs.briefExcerpt, JSON.stringify(cs.turns), JSON.stringify(cs.vulnerabilities), cs.createdAt]
+      );
+    }
+
+    // 9. Tracked cases upsert
+    for (const tc of state.trackedCases) {
+      await client.query(
+        `INSERT INTO tracked_cases (id, matter_id, user_id, case_number, court, courtroom, bench, cause_list_item, next_hearing_date, stage, notes, cnr_number, status, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+         ON CONFLICT (id) DO UPDATE SET
+           status = EXCLUDED.status,
+           next_hearing_date = EXCLUDED.next_hearing_date,
+           stage = EXCLUDED.stage,
+           notes = EXCLUDED.notes,
+           updated_at = EXCLUDED.updated_at;`,
+        [tc.id, tc.matterId, tc.userId, tc.caseNumber, tc.court, tc.courtroom || '', tc.bench || '', tc.causeListItem || '', tc.nextHearingDate, tc.stage, tc.notes || '', tc.cnrNumber || '', tc.status, tc.createdAt, tc.createdAt]
+      );
+    }
+
+    // 10. Assistant messages upsert
+    for (const am of state.assistantMessages) {
+      await client.query(
+        `INSERT INTO assistant_messages (id, user_id, matter_id, role, content, language_used, verification_mode, confidence_note, sources, completed_actions, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (id) DO NOTHING;`,
+        [am.id, am.userId, am.matterId, am.role, am.content, am.languageUsed, am.verificationMode, am.confidenceNote || '', JSON.stringify(am.sources), JSON.stringify(am.completedActions), am.createdAt]
+      );
+    }
   } catch (err) {
     console.error('[Neon PostgreSQL] Failed to sync store snapshot:', err);
   } finally {
     client?.release();
+  }
+}
+
+export async function deleteUserFromNeon(userId: string): Promise<void> {
+  const pool = await getNeonPool();
+  if (!pool) return;
+  try {
+    await Promise.all([
+      pool.query('DELETE FROM assistant_messages WHERE user_id = $1;', [userId]),
+      pool.query('DELETE FROM deadlines WHERE user_id = $1;', [userId]),
+      pool.query('DELETE FROM tracked_cases WHERE user_id = $1;', [userId]),
+      pool.query('DELETE FROM courtroom_sessions WHERE user_id = $1;', [userId]),
+      pool.query('DELETE FROM contract_reviews WHERE user_id = $1;', [userId]),
+      pool.query('DELETE FROM vault_documents WHERE user_id = $1;', [userId]),
+      pool.query('DELETE FROM research_memos WHERE user_id = $1;', [userId]),
+      pool.query('DELETE FROM drafts WHERE user_id = $1;', [userId]),
+      pool.query('DELETE FROM matters WHERE user_id = $1;', [userId]),
+      pool.query('DELETE FROM users WHERE id = $1;', [userId]),
+    ]);
+  } catch (err) {
+    console.error('[Neon PostgreSQL] Failed to delete user:', err);
+  }
+}
+
+export async function deleteMatterFromNeon(matterId: string): Promise<void> {
+  const pool = await getNeonPool();
+  if (!pool) return;
+  try {
+    await Promise.all([
+      pool.query('DELETE FROM deadlines WHERE matter_id = $1;', [matterId]),
+      pool.query('DELETE FROM tracked_cases WHERE matter_id = $1;', [matterId]),
+      pool.query('DELETE FROM courtroom_sessions WHERE matter_id = $1;', [matterId]),
+      pool.query('DELETE FROM contract_reviews WHERE matter_id = $1;', [matterId]),
+      pool.query('DELETE FROM vault_documents WHERE matter_id = $1;', [matterId]),
+      pool.query('DELETE FROM research_memos WHERE matter_id = $1;', [matterId]),
+      pool.query('DELETE FROM drafts WHERE matter_id = $1;', [matterId]),
+      pool.query('DELETE FROM matters WHERE id = $1;', [matterId]),
+    ]);
+  } catch (err) {
+    console.error('[Neon PostgreSQL] Failed to delete matter:', err);
   }
 }
