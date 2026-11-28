@@ -133,12 +133,6 @@ export default function App() {
     setActiveSection('overview');
   };
 
-  if (!user) {
-    return <AuthGate onAuthenticated={hydrateWorkspace} />;
-  }
-
-  const activeNav = NAV_ITEMS.find((n) => n.id === activeSection) ?? NAV_ITEMS[0];
-
   const isAdmin = Boolean(
     user?.isAdmin ||
     user?.role?.toLowerCase() === 'admin' ||
@@ -153,6 +147,12 @@ export default function App() {
       return true;
     });
   }, [isAdmin]);
+
+  if (!user) {
+    return <AuthGate onAuthenticated={hydrateWorkspace} />;
+  }
+
+  const activeNav = NAV_ITEMS.find((n) => n.id === activeSection) ?? NAV_ITEMS[0];
 
   const scopedMemos =
     bundle?.researchMemos.filter((m) => !activeMatter || m.matterId === activeMatter.id) ?? [];
