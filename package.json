@@ -9,6 +9,8 @@
     "start": "node server.js",
     "preview": "vite preview",
     "test": "tsx --test src/lib/legal/*.test.ts",
+    "test:integration": "tsx --test src/server/integration.test.ts",
+    "test:e2e": "node scripts/e2e-playwright.mjs",
     "clean": "node -e \"fs.rmSync('dist', { recursive: true, force: true }); fs.rmSync('server.js', { force: true })\"",
     "lint": "tsc --noEmit"
   },
@@ -37,6 +39,7 @@
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.28.0",
+    "playwright": "^1.65.1",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2"
   }

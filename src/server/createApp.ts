@@ -2,9 +2,18 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import { z } from 'zod';
-import { requireAuth, signSessionToken, type AuthRequest } from './auth.js';
+import {
+  clearAuthCookies,
+  createRateLimiter,
+  isUserAdminRole,
+  requireAuth,
+  setAuthCookies,
+  signSessionToken,
+  type AuthRequest,
+} from './auth.js';
+import { registerExtendedRoutes, type ApiMetricsSnapshot } from './extendedRoutes.js';
 import { repository } from './repository.js';
-import { isNeonConfigured, testNeonConnection } from './neonDatabase.js';
+import { getNeonHealthSnapshot, isNeonConfigured, testNeonConnection } from './neonDatabase.js';
 import {
   analyzeContractRedline,
   answerWhatsAppQuery,
@@ -99,33 +108,78 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
     if (req.body && typeof req.body === 'object' && !(req as any)._body) {
       (req as any)._body = true;
     }
-    // Route normalization for Vercel rewrites
-    const matchedPath = (req.headers['x-matched-path'] || req.headers['x-forwarded-uri'] || '') as string;
-    if (matchedPath && matchedPath.startsWith('/api') && (req.url === '/api' || req.url === '/api/')) {
-      req.url = matchedPath;
-    } else if (req.url && !req.url.startsWith('/api')) {
-      req.url = '/api' + (req.url.startsWith('/') ? req.url : '/' + req.url);
+    // Route normalization for serverless platforms (Vercel /api rewrites only)
+    if (!includeStatic) {
+      const matchedPath = (req.headers['x-matched-path'] || req.headers['x-forwarded-uri'] || '') as string;
+      if (matchedPath && matchedPath.startsWith('/api') && (req.url === '/api' || req.url === '/api/')) {
+        req.url = matchedPath;
+      } else if (req.url && !req.url.startsWith('/api')) {
+        req.url = '/api' + (req.url.startsWith('/') ? req.url : '/' + req.url);
+      }
     }
     next();
   });
 
   app.use(express.json({ limit: '20mb' }));
 
-  // Basic security headers aligned with Cloudflare & Vercel production config
-  app.use((_req, res, next) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  const metrics: ApiMetricsSnapshot = {
+    totalRequests: 0,
+    errorCount: 0,
+    aiRequestCount: 0,
+    aiFailureCount: 0,
+    avgLatencyMs: 0,
+    startedAt: new Date().toISOString(),
+  };
+  let totalLatencyAccum = 0;
+
+  // Request latency & error observability
+  app.use((req, res, next) => {
+    const start = Date.now();
+    const isAi = req.path.startsWith('/api/ai/');
+    if (isAi) metrics.aiRequestCount += 1;
+    metrics.totalRequests += 1;
+    res.on('finish', () => {
+      const elapsed = Date.now() - start;
+      totalLatencyAccum += elapsed;
+      metrics.avgLatencyMs = Math.round(totalLatencyAccum / Math.max(1, metrics.totalRequests));
+      if (res.statusCode >= 500) {
+        metrics.errorCount += 1;
+        if (isAi) metrics.aiFailureCount += 1;
+      }
+    });
     next();
   });
+
+  // Security headers aligned with enterprise SaaS & Vercel deployment
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'microphone=(self), camera=(), geolocation=()');
+    if (IS_PROD) {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
+  });
+
+  const authLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 30, keyPrefix: 'auth' });
+  const aiLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 60, keyPrefix: 'ai' });
+  app.use('/api/auth', authLimiter);
+  app.use('/api/ai', aiLimiter);
 
   // Health probe
   app.get('/api/health', async (_req, res) => {
     const nv = getNvidiaConfig();
     const neonCheck = isNeonConfigured() ? await testNeonConnection() : null;
-    res.json({
-      ok: true,
+    const dbOk = !isNeonConfigured() || Boolean(neonCheck?.ok);
+    res.status(dbOk ? 200 : 503).json({
+      ok: dbOk,
       storageEngine: repository.engine,
       neon: neonCheck,
+      neonSync: getNeonHealthSnapshot(),
+      lastPersistError: repository.lastPersistError,
+      counts: repository.getSystemCounts(),
+      metrics,
       aiEngine: {
         nvidiaConfigured: nv.configured,
         geminiConfigured: isGeminiConfigured(),
@@ -148,8 +202,20 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
       });
       const data = schema.parse(req.body);
       const user = await repository.registerUser(data);
-      const token = signSessionToken(user.id, user.email);
-      res.status(201).json({ token, user });
+      const { token, csrfToken } = signSessionToken(user.id, user.email, user.organizationId);
+      setAuthCookies(res, token, csrfToken);
+      repository.logAuditEvent({
+        organizationId: user.organizationId || '',
+        userId: user.id,
+        actorEmail: user.email,
+        eventType: 'auth_register',
+        resourceType: 'user',
+        resourceId: user.id,
+        status: 'success',
+        details: 'New workspace user registered.',
+      });
+      await repository.persist();
+      res.status(201).json({ token, csrfToken, user });
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
@@ -167,8 +233,19 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         res.status(401).json({ error: 'Invalid email or password.' });
         return;
       }
-      const token = signSessionToken(user.id, user.email);
-      res.json({ token, user });
+      const { token, csrfToken } = signSessionToken(user.id, user.email, user.organizationId);
+      setAuthCookies(res, token, csrfToken);
+      repository.logAuditEvent({
+        organizationId: user.organizationId || '',
+        userId: user.id,
+        actorEmail: user.email,
+        eventType: 'auth_login',
+        resourceType: 'session',
+        status: 'success',
+        details: 'User signed in.',
+      });
+      await repository.persist();
+      res.json({ token, csrfToken, user });
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
@@ -177,22 +254,36 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
   app.post('/api/auth/demo', async (_req, res) => {
     await repository.ensureReady();
     const user = repository.getDemoUser();
-    const token = signSessionToken(user.id, user.email);
-    res.json({ token, user });
+    const { token, csrfToken } = signSessionToken(user.id, user.email, user.organizationId);
+    setAuthCookies(res, token, csrfToken);
+    res.json({ token, csrfToken, user });
+  });
+
+  app.post('/api/auth/logout', requireAuth, async (req: AuthRequest, res) => {
+    if (req.authUser?.jti) {
+      await repository.revokeToken(req.authUser.jti, req.authUser.exp);
+    }
+    clearAuthCookies(res);
+    res.json({ loggedOut: true });
+  });
+
+  app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res) => {
+    const user = await repository.getUserById(req.authUser!.userId);
+    if (!user) {
+      res.status(404).json({ error: 'User not found.' });
+      return;
+    }
+    res.json({
+      user,
+      subscription: user.organizationId ? repository.getSubscriptionForOrg(user.organizationId) : undefined,
+    });
   });
 
   // --- Admin Middleware & User Management Routes ---
   const requireAdmin = (req: AuthRequest, res: express.Response, next: express.NextFunction) => {
     requireAuth(req, res, async () => {
       const user = await repository.getUserById(req.authUser!.userId);
-      const isAllowed = Boolean(
-        user?.isAdmin ||
-        user?.role?.toLowerCase() === 'admin' ||
-        user?.role?.toLowerCase() === 'administrator' ||
-        user?.email === 'vidhios@admin.com' ||
-        user?.email === 'chambers@vidhios.in'
-      );
-      if (!isAllowed) {
+      if (!user || !isUserAdminRole(user)) {
         res.status(403).json({ error: 'Access denied: Administrator privileges required.' });
         return;
       }
@@ -314,12 +405,11 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
   });
 
   app.delete('/api/matters/:id', requireAuth, async (req: AuthRequest, res) => {
-    const deleted = repository.deleteMatter(req.authUser!.userId, String(req.params.id));
+    const deleted = await repository.deleteMatter(req.authUser!.userId, String(req.params.id));
     if (!deleted) {
       res.status(404).json({ error: 'Matter not found.' });
       return;
     }
-    await repository.persist();
     res.json({ deleted: true });
   });
 
@@ -350,6 +440,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
       const schema = z.object({
         title: z.string().min(2).max(200).optional(),
         content: z.string().max(120000).optional(),
+        status: z.enum(['draft', 'awaiting_review', 'approved']).optional(),
       });
       const data = schema.parse(req.body);
       const updated = repository.updateDraft(req.authUser!.userId, String(req.params.id), data);
@@ -598,6 +689,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         commandTag,
       });
 
+      await repository.persist();
       res.json({ userMsg, assistantMsg, createdDeadline });
     } catch (err) {
       res.status(500).json({ error: extractErrorMessage(err) });
@@ -612,8 +704,24 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         query: z.string().min(5).max(3000),
         jurisdiction: z.enum(['india_litigation', 'corporate_ma', 'global_multi']),
         tier: z.enum(['fast', 'expert']).optional().default('fast'),
+        filters: z
+          .object({
+            court: z.string().optional(),
+            judge: z.string().optional(),
+            statute: z.string().optional(),
+            caseName: z.string().optional(),
+            citation: z.string().optional(),
+            dateFrom: z.string().optional(),
+            dateTo: z.string().optional(),
+          })
+          .optional(),
       });
       const data = schema.parse(req.body);
+      const quota = repository.checkAiQuota(req.authUser!.userId);
+      if (!quota.allowed) {
+        res.status(402).json({ error: quota.reason });
+        return;
+      }
       const matter = repository.getMatterForUser(req.authUser!.userId, data.matterId);
       if (!matter) {
         res.status(404).json({ error: 'Matter not found.' });
@@ -625,16 +733,20 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         jurisdiction: data.jurisdiction,
         matterContext,
         tier: data.tier,
+        filters: data.filters,
       });
       const saved = repository.addResearchMemo({
         matterId: matter.id,
         userId: req.authUser!.userId,
         query: data.query,
         jurisdiction: data.jurisdiction,
+        filters: data.filters,
         answerMarkdown: result.answerMarkdown,
         citations: result.citations,
         citationIntegrity: result.citationIntegrity,
       });
+      repository.recordAiUsage(req.authUser!.userId, Math.ceil(result.answerMarkdown.length / 4));
+      await repository.persist();
       res.status(201).json(saved);
     } catch (err) {
       res.status(500).json({ error: extractErrorMessage(err) });
@@ -649,8 +761,24 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         query: z.string().min(5).max(3000),
         jurisdiction: z.enum(['india_litigation', 'corporate_ma', 'global_multi']),
         tier: z.enum(['fast', 'expert']).optional().default('fast'),
+        filters: z
+          .object({
+            court: z.string().optional(),
+            judge: z.string().optional(),
+            statute: z.string().optional(),
+            caseName: z.string().optional(),
+            citation: z.string().optional(),
+            dateFrom: z.string().optional(),
+            dateTo: z.string().optional(),
+          })
+          .optional(),
       });
       const data = schema.parse(req.body);
+      const quota = repository.checkAiQuota(req.authUser!.userId);
+      if (!quota.allowed) {
+        res.status(402).json({ error: quota.reason });
+        return;
+      }
       const matter = repository.getMatterForUser(req.authUser!.userId, data.matterId);
       if (!matter) {
         res.status(404).json({ error: 'Matter not found.' });
@@ -674,6 +802,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
           jurisdiction: data.jurisdiction,
           matterContext,
           tier: data.tier,
+          filters: data.filters,
         },
         (update) => {
           sendEvent(update.type, update.data);
@@ -685,12 +814,16 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         userId: req.authUser!.userId,
         query: data.query,
         jurisdiction: data.jurisdiction,
+        filters: data.filters,
         answerMarkdown: result.answerMarkdown,
         citations: result.citations,
         citationIntegrity: result.citationIntegrity,
       });
 
-      sendEvent('complete', saved);
+      repository.recordAiUsage(req.authUser!.userId, Math.ceil(result.answerMarkdown.length / 4));
+      await repository.persist();
+
+      sendEvent('complete', { ...saved, conflicts: result.conflicts });
       res.end();
     } catch (err) {
       if (!res.headersSent) {
@@ -944,13 +1077,19 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         userId,
         fileName: data.fileName,
         mimeType: data.mimeType,
+        fileSizeBytes: data.base64Data
+          ? Math.ceil((data.base64Data.length * 3) / 4)
+          : Buffer.byteLength(data.textInput || '', 'utf8'),
         docCategory: data.docCategory,
+        processingStatus: 'completed',
         extractedText: result.extractedText,
         translatedText: result.translatedText,
         targetLanguage: data.targetLanguage === 'None' ? '' : data.targetLanguage,
+        entities: result.entities,
         chronology: result.chronology,
         contradictions: result.contradictions,
       });
+      await repository.persist();
       res.status(201).json(saved);
     } catch (err) {
       res.status(500).json({ error: extractErrorMessage(err) });
@@ -1003,6 +1142,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         actionItems: result.actionItems,
         statutoryIssues: result.statutoryIssues,
       });
+      await repository.persist();
       res.status(201).json(saved);
     } catch (err) {
       res.status(500).json({ error: extractErrorMessage(err) });
@@ -1238,6 +1378,7 @@ export async function createExpressApp(options: { includeStatic?: boolean } = {}
         docType: tpl.name,
         content: fullText,
       });
+      await repository.persist();
 
       sendEvent('done', {
         draft: savedDraft,
@@ -1599,10 +1740,11 @@ Recommended Next Filings: ${analysis.recommendedFilings.map((f) => f.title).join
   });
 
   app.delete('/api/ai/assistant', requireAuth, async (req: AuthRequest, res) => {
-    repository.clearAssistantMessages(req.authUser!.userId);
-    await repository.persist();
+    await repository.clearAssistantMessages(req.authUser!.userId);
     res.json({ cleared: true });
   });
+
+  registerExtendedRoutes(app, metrics);
 
   // --- Frontend Mounting (Vite Dev Middleware or Production Static) ---
   if (includeStatic) {

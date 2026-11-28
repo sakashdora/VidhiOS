@@ -1,33 +1,57 @@
 import type {
+  ActivityLogItem,
   AdminUserSummary,
   AssistantLanguageMode,
   AssistantMessage,
+  AuditEventItem,
   CaseAnalysisReport,
+  ClientProfile,
   ContractReview,
+  CorporateProfileRecord,
   CourtroomSession,
   DeadlineItem,
   DraftDocument,
+  EvidenceItemRecord,
+  HearingRecord,
   JurisdictionMode,
+  LitigationStrategyRecord,
   Matter,
+  MatterTask,
   MeetingBrief,
+  NotificationItem,
+  Organization,
   RedlineClause,
   ResearchMemo,
+  SubscriptionRecord,
+  SubscriptionTier,
   TrackedCase,
   UserProfile,
   VaultDocument,
   WhatsAppMessage,
+  WorkflowRunRecord,
   WorkspaceBundle,
 } from '../types/legal';
 
-// Session token held strictly in JS memory (never localStorage or sessionStorage)
+// Session token held strictly in JS memory (supplemented by HTTP-only cookie + CSRF header)
 let memoryToken: string | null = null;
+let memoryCsrfToken: string | null = null;
 
-export function setAuthToken(token: string | null): void {
+export function setAuthToken(token: string | null, csrfToken?: string | null): void {
   memoryToken = token;
+  if (csrfToken !== undefined) {
+    memoryCsrfToken = csrfToken;
+  }
 }
 
 export function getAuthToken(): string | null {
   return memoryToken;
+}
+
+function readCsrfCookie(): string {
+  if (memoryCsrfToken) return memoryCsrfToken;
+  if (typeof document === 'undefined') return '';
+  const match = /(?:^|;\s*)vidhios_csrf=([^;]+)/.exec(document.cookie);
+  return match ? decodeURIComponent(match[1]) : '';
 }
 
 async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
@@ -38,9 +62,14 @@ async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
   if (memoryToken) {
     headers.Authorization = `Bearer ${memoryToken}`;
   }
+  const csrf = readCsrfCookie();
+  if (csrf) {
+    headers['x-csrf-token'] = csrf;
+  }
 
   const res = await fetch(url, {
     ...options,
+    credentials: 'include',
     headers,
   });
 
@@ -58,7 +87,7 @@ async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
 export const api = {
   // Auth
   login: (email: string, password: string) =>
-    apiFetch<{ token: string; user: UserProfile }>('/api/auth/login', {
+    apiFetch<{ token: string; csrfToken?: string; user: UserProfile }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email, password }),
     }),
@@ -71,15 +100,23 @@ export const api = {
     role?: string;
     defaultJurisdiction?: JurisdictionMode;
   }) =>
-    apiFetch<{ token: string; user: UserProfile }>('/api/auth/register', {
+    apiFetch<{ token: string; csrfToken?: string; user: UserProfile }>('/api/auth/register', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
 
   demoLogin: () =>
-    apiFetch<{ token: string; user: UserProfile }>('/api/auth/demo', {
+    apiFetch<{ token: string; csrfToken?: string; user: UserProfile }>('/api/auth/demo', {
       method: 'POST',
     }),
+
+  logout: () =>
+    apiFetch<{ loggedOut: boolean }>('/api/auth/logout', {
+      method: 'POST',
+    }),
+
+  getMe: () =>
+    apiFetch<{ user: UserProfile; subscription?: SubscriptionRecord }>('/api/auth/me'),
 
   // Workspace
   getWorkspace: () => apiFetch<WorkspaceBundle>('/api/workspace'),
@@ -100,9 +137,88 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  updateMatter: (
+    matterId: string,
+    payload: Partial<
+      Pick<
+        Matter,
+        | 'title'
+        | 'status'
+        | 'forum'
+        | 'opposingParty'
+        | 'clientName'
+        | 'summaryFacts'
+        | 'cnrNumber'
+        | 'caseType'
+        | 'assignedAdvocate'
+        | 'filingDate'
+      >
+    >
+  ) =>
+    apiFetch<Matter>(`/api/matters/${matterId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+
   deleteMatter: (matterId: string) =>
     apiFetch<{ deleted: boolean }>(`/api/matters/${matterId}`, {
       method: 'DELETE',
+    }),
+
+  // Clients, Tasks, Hearings & Notifications
+  createClient: (payload: {
+    name: string;
+    email?: string;
+    phone?: string;
+    company?: string;
+    address?: string;
+    panOrCin?: string;
+    notes?: string;
+    portalAccessEnabled?: boolean;
+  }) =>
+    apiFetch<ClientProfile>('/api/clients', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  createTask: (payload: {
+    matterId: string;
+    title: string;
+    priority: MatterTask['priority'];
+    dueDate: string;
+    assignedToName?: string;
+  }) =>
+    apiFetch<MatterTask>('/api/tasks', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  updateTaskStatus: (taskId: string, status: MatterTask['status']) =>
+    apiFetch<MatterTask>(`/api/tasks/${taskId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status }),
+    }),
+
+  createHearing: (payload: {
+    matterId: string;
+    hearingDate: string;
+    court: string;
+    courtroom?: string;
+    bench?: string;
+    causeListItem?: string;
+    outcome: HearingRecord['outcome'];
+    nextHearingDate?: string;
+    adjournmentReason?: string;
+    notes?: string;
+  }) =>
+    apiFetch<HearingRecord>('/api/hearings', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  markNotificationRead: (id: string) =>
+    apiFetch<NotificationItem>(`/api/notifications/${id}/read`, {
+      method: 'PATCH',
     }),
 
   // Research
@@ -111,6 +227,7 @@ export const api = {
     query: string;
     jurisdiction: JurisdictionMode;
     tier?: 'fast' | 'expert';
+    filters?: ResearchMemo['filters'];
   }) =>
     apiFetch<ResearchMemo>('/api/ai/research', {
       method: 'POST',
@@ -123,13 +240,15 @@ export const api = {
       query: string;
       jurisdiction: JurisdictionMode;
       tier?: 'fast' | 'expert';
+      filters?: ResearchMemo['filters'];
     },
     callbacks: {
       onStage?: (stage: { stage: string; label: string }) => void;
-      onAuthorities?: (data: { authorities: any[]; citations: any[] }) => void;
+      onAuthorities?: (data: { authorities: any[]; citations: any[]; conflicts?: any[] }) => void;
       onChunk?: (delta: string) => void;
-    }
-  ): Promise<ResearchMemo> => {
+    },
+    abortSignal?: AbortSignal
+  ): Promise<ResearchMemo & { conflicts?: any[] }> => {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
@@ -137,11 +256,17 @@ export const api = {
     if (memoryToken) {
       headers.Authorization = `Bearer ${memoryToken}`;
     }
+    const csrf = readCsrfCookie();
+    if (csrf) {
+      headers['x-csrf-token'] = csrf;
+    }
 
     const res = await fetch('/api/ai/research/stream', {
       method: 'POST',
+      credentials: 'include',
       headers,
       body: JSON.stringify(payload),
+      signal: abortSignal,
     });
 
     if (!res.ok) {
@@ -157,7 +282,7 @@ export const api = {
     const decoder = new TextDecoder();
     let buffer = '';
     let currentEvent = 'message';
-    let memoResult: ResearchMemo | null = null;
+    let memoResult: (ResearchMemo & { conflicts?: any[] }) | null = null;
 
     while (true) {
       const { value, done } = await reader.read();
@@ -180,11 +305,11 @@ export const api = {
           if (currentEvent === 'stage' && callbacks.onStage) {
             callbacks.onStage(parsed as { stage: string; label: string });
           } else if (currentEvent === 'authorities' && callbacks.onAuthorities) {
-            callbacks.onAuthorities(parsed as { authorities: any[]; citations: any[] });
+            callbacks.onAuthorities(parsed as { authorities: any[]; citations: any[]; conflicts?: any[] });
           } else if (currentEvent === 'chunk' && typeof parsed.delta === 'string') {
             callbacks.onChunk?.(parsed.delta);
           } else if (currentEvent === 'complete') {
-            memoResult = parsed as unknown as ResearchMemo;
+            memoResult = parsed as unknown as ResearchMemo & { conflicts?: any[] };
           } else if (currentEvent === 'error') {
             throw new Error(
               typeof parsed.error === 'string' ? parsed.error : 'Research streaming failed.'
@@ -212,7 +337,10 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  updateDraft: (draftId: string, payload: { title?: string; content?: string }) =>
+  updateDraft: (
+    draftId: string,
+    payload: { title?: string; content?: string; status?: DraftDocument['status'] }
+  ) =>
     apiFetch<DraftDocument>(`/api/drafts/${draftId}`, {
       method: 'PATCH',
       body: JSON.stringify(payload),
@@ -286,9 +414,14 @@ export const api = {
     if (memoryToken) {
       headers.Authorization = `Bearer ${memoryToken}`;
     }
+    const csrf = readCsrfCookie();
+    if (csrf) {
+      headers['x-csrf-token'] = csrf;
+    }
 
     const res = await fetch('/api/ai/judiciary-form/stream', {
       method: 'POST',
+      credentials: 'include',
       headers,
       body: JSON.stringify(payload),
     });
@@ -363,9 +496,14 @@ export const api = {
     if (memoryToken) {
       headers.Authorization = `Bearer ${memoryToken}`;
     }
+    const csrf = readCsrfCookie();
+    if (csrf) {
+      headers['x-csrf-token'] = csrf;
+    }
 
     const res = await fetch('/api/export/docx', {
       method: 'POST',
+      credentials: 'include',
       headers,
       body: JSON.stringify(payload),
     });
@@ -454,6 +592,17 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  updateVaultDocument: (
+    docId: string,
+    payload: Partial<
+      Pick<VaultDocument, 'extractedText' | 'translatedText' | 'chronology' | 'processingStatus'>
+    >
+  ) =>
+    apiFetch<VaultDocument>(`/api/vault/${docId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+
   // Cases & Deadlines
   addTrackedCase: (payload: {
     matterId: string;
@@ -522,13 +671,16 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  // VidhiOS Bilingual (Hindi / English) Zero-Hallucination Assistant
-  sendAssistantMessage: (payload: {
-    matterId: string | null;
-    message: string;
-    languageMode: AssistantLanguageMode;
-    jurisdiction: JurisdictionMode;
-  }) =>
+  // VidhiOS Bilingual Assistant
+  sendAssistantMessage: (
+    payload: {
+      matterId: string | null;
+      message: string;
+      languageMode: AssistantLanguageMode;
+      jurisdiction: JurisdictionMode;
+    },
+    abortSignal?: AbortSignal
+  ) =>
     apiFetch<{
       userMsg: AssistantMessage;
       assistantMsg: AssistantMessage;
@@ -537,6 +689,7 @@ export const api = {
     }>('/api/ai/assistant', {
       method: 'POST',
       body: JSON.stringify(payload),
+      signal: abortSignal,
     }),
 
   clearAssistantHistory: () =>
@@ -544,8 +697,121 @@ export const api = {
       method: 'DELETE',
     }),
 
-  // Admin User Management
+  // Multi-Agent Workflows
+  runMultiAgentWorkflow: (payload: {
+    matterId?: string | null;
+    workflowType:
+      | 'full_matter_brief'
+      | 'research_verification'
+      | 'draft_audit'
+      | 'contract_risk_audit'
+      | 'compliance_deadline_check';
+    goal: string;
+    extraContext?: string;
+  }) =>
+    apiFetch<WorkflowRunRecord>('/api/ai/workflows/run', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  approveWorkflowRun: (runId: string) =>
+    apiFetch<WorkflowRunRecord>(`/api/ai/workflows/${runId}/approve`, {
+      method: 'POST',
+    }),
+
+  // Translation Studio
+  translateLegalText: (payload: {
+    sourceText: string;
+    sourceLanguage: string;
+    targetLanguage: string;
+    jurisdiction: JurisdictionMode;
+  }) =>
+    apiFetch<{
+      translatedText: string;
+      segments: Array<{ original: string; translated: string }>;
+      terminologyNotes: string[];
+      qualityWarning: string;
+    }>('/api/ai/translate', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  // Corporate Intelligence
+  lookupCorporate: (payload: { query: string; matterId?: string }) =>
+    apiFetch<{ profile: CorporateProfileRecord; providerConfigured: boolean }>(
+      '/api/corporate/lookup',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
+    ),
+
+  // Knowledge Graph, Strategy & Evidence
+  getKnowledgeGraph: (matterId: string) =>
+    apiFetch<{
+      graph: {
+        nodes: Array<{ id: string; label: string; category: string }>;
+        edges: Array<{ from: string; to: string; relation: string }>;
+      };
+      conflicts: Array<{
+        topic: string;
+        supportingAuthority: string;
+        adverseOrDistinguishedAuthority: string;
+        courtHierarchyNote: string;
+        distinctionSummary: string;
+      }>;
+    }>(`/api/intelligence/graph?matterId=${encodeURIComponent(matterId)}`),
+
+  generateStrategy: (matterId: string) =>
+    apiFetch<LitigationStrategyRecord>('/api/intelligence/strategy', {
+      method: 'POST',
+      body: JSON.stringify({ matterId }),
+    }),
+
+  addEvidenceItem: (payload: {
+    matterId: string;
+    exhibitNumber: string;
+    title: string;
+    sourceDocumentId?: string;
+    witnessName?: string;
+    admissibilityStatus: EvidenceItemRecord['admissibilityStatus'];
+    notes: string;
+  }) =>
+    apiFetch<EvidenceItemRecord>('/api/intelligence/evidence', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  // Subscriptions
+  upgradeSubscription: (tier: SubscriptionTier) =>
+    apiFetch<{ subscription: SubscriptionRecord; billingNote: string }>(
+      '/api/subscription/upgrade',
+      {
+        method: 'POST',
+        body: JSON.stringify({ tier }),
+      }
+    ),
+
+  // Admin User & Governance Management
   getAdminUsers: () => apiFetch<{ users: AdminUserSummary[] }>('/api/admin/users'),
+
+  getAdminOverview: () =>
+    apiFetch<{
+      organizations: Array<Organization & { membersCount: number; subscription?: SubscriptionRecord }>;
+      auditEvents: AuditEventItem[];
+      counts: Record<string, number>;
+      metrics: Record<string, any>;
+      health: Record<string, any>;
+    }>('/api/admin/overview'),
+
+  updateOrgSubscription: (orgId: string, tier: SubscriptionTier) =>
+    apiFetch<{ subscription: SubscriptionRecord }>(
+      `/api/admin/organizations/${orgId}/subscription`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ tier }),
+      }
+    ),
 
   createAdminUser: (payload: {
     email: string;

@@ -5,12 +5,27 @@ import "dotenv/config";
 import "dotenv/config";
 import express from "express";
 import path2 from "node:path";
-import { z } from "zod";
+import { z as z2 } from "zod";
 
 // src/server/auth.ts
 import crypto from "node:crypto";
-var SESSION_SECRET = process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 16 ? process.env.SESSION_SECRET : process.env.DATABASE_URL ? crypto.createHash("sha256").update(process.env.DATABASE_URL).digest("hex") : "vidhios-secure-session-signing-secret-2026-chambers-token-auth";
+var IS_PROD = process.env.NODE_ENV === "production";
+var ENV_SECRET = (process.env.SESSION_SECRET ?? "").trim();
+var SESSION_SECRET = (() => {
+  if (ENV_SECRET.length >= 16) {
+    return ENV_SECRET;
+  }
+  if (IS_PROD) {
+    console.warn(
+      "[VidhiOS Security Warning] SESSION_SECRET is unset or < 16 chars in production. Using ephemeral CSPRNG secret; set SESSION_SECRET in environment variables for persistent multi-instance sessions."
+    );
+  }
+  return crypto.randomBytes(32).toString("hex");
+})();
+var SESSION_COOKIE_NAME = "vidhios_session";
+var CSRF_COOKIE_NAME = "vidhios_csrf";
 var TOKEN_TTL_MS = 1e3 * 60 * 60 * 24 * 7;
+var revokedTokenIds = /* @__PURE__ */ new Map();
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
   const derived = crypto.scryptSync(password, salt, 64).toString("hex");
@@ -20,20 +35,42 @@ function verifyPassword(password, storedHash) {
   const parts = storedHash.split(":");
   if (parts.length !== 2) return false;
   const [salt, keyHex] = parts;
+  if (!salt || !keyHex) return false;
   const derived = crypto.scryptSync(password, salt, 64);
   const storedBuf = Buffer.from(keyHex, "hex");
   if (derived.length !== storedBuf.length) return false;
   return crypto.timingSafeEqual(derived, storedBuf);
 }
-function signSessionToken(userId, email) {
+function signSessionToken(userId, email, organizationId) {
+  const jti = crypto.randomUUID();
+  const exp = Date.now() + TOKEN_TTL_MS;
   const payload = {
+    jti,
     userId,
     email,
-    exp: Date.now() + TOKEN_TTL_MS
+    organizationId,
+    exp
   };
   const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
   const sig = crypto.createHmac("sha256", SESSION_SECRET).update(encoded).digest("base64url");
-  return `${encoded}.${sig}`;
+  const csrfToken = crypto.randomBytes(24).toString("base64url");
+  return { token: `${encoded}.${sig}`, jti, exp, csrfToken };
+}
+function revokeSessionTokenId(jti, exp) {
+  revokedTokenIds.set(jti, exp);
+  const now = Date.now();
+  for (const [id, expiresAt] of revokedTokenIds.entries()) {
+    if (expiresAt < now) revokedTokenIds.delete(id);
+  }
+}
+function isSessionTokenRevoked(jti) {
+  const exp = revokedTokenIds.get(jti);
+  if (!exp) return false;
+  if (Date.now() > exp) {
+    revokedTokenIds.delete(jti);
+    return false;
+  }
+  return true;
 }
 function verifySessionToken(token) {
   const parts = token.split(".");
@@ -49,1547 +86,134 @@ function verifySessionToken(token) {
     const parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
     if (!parsed.userId || !parsed.email || typeof parsed.exp !== "number") return null;
     if (Date.now() > parsed.exp) return null;
+    if (parsed.jti && isSessionTokenRevoked(parsed.jti)) return null;
     return parsed;
   } catch {
     return null;
   }
 }
+function parseCookies(cookieHeader) {
+  const result = {};
+  if (!cookieHeader) return result;
+  for (const pair of cookieHeader.split(";")) {
+    const idx = pair.indexOf("=");
+    if (idx === -1) continue;
+    const key = pair.slice(0, idx).trim();
+    const val = pair.slice(idx + 1).trim();
+    if (key) {
+      try {
+        result[key] = decodeURIComponent(val);
+      } catch {
+        result[key] = val;
+      }
+    }
+  }
+  return result;
+}
+function setAuthCookies(res, token, csrfToken) {
+  const maxAgeSec = Math.floor(TOKEN_TTL_MS / 1e3);
+  const secureFlag = IS_PROD ? "; Secure" : "";
+  res.append(
+    "Set-Cookie",
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSec}${secureFlag}`
+  );
+  res.append(
+    "Set-Cookie",
+    `${CSRF_COOKIE_NAME}=${encodeURIComponent(csrfToken)}; Path=/; SameSite=Lax; Max-Age=${maxAgeSec}${secureFlag}`
+  );
+}
+function clearAuthCookies(res) {
+  const secureFlag = IS_PROD ? "; Secure" : "";
+  res.append(
+    "Set-Cookie",
+    `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secureFlag}`
+  );
+  res.append(
+    "Set-Cookie",
+    `${CSRF_COOKIE_NAME}=; Path=/; SameSite=Lax; Max-Age=0${secureFlag}`
+  );
+}
 function requireAuth(req, res, next) {
   const header = req.headers.authorization;
-  if (!header || !header.startsWith("Bearer ")) {
+  let token = "";
+  let usedCookie = false;
+  if (header && header.startsWith("Bearer ")) {
+    token = header.slice("Bearer ".length).trim();
+  } else {
+    const cookies = parseCookies(req.headers.cookie);
+    if (cookies[SESSION_COOKIE_NAME]) {
+      token = cookies[SESSION_COOKIE_NAME];
+      usedCookie = true;
+      const method = req.method.toUpperCase();
+      if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+        const csrfHeader = String(req.headers["x-csrf-token"] ?? "");
+        const csrfCookie = cookies[CSRF_COOKIE_NAME] ?? "";
+        if (!csrfHeader || !csrfCookie || csrfHeader !== csrfCookie) {
+          res.status(403).json({ error: "CSRF validation failed." });
+          return;
+        }
+      }
+    }
+  }
+  if (!token) {
     res.status(401).json({ error: "Authentication required. Please sign in." });
     return;
   }
-  const token = header.slice("Bearer ".length).trim();
   const payload = verifySessionToken(token);
   if (!payload) {
+    if (usedCookie) clearAuthCookies(res);
     res.status(401).json({ error: "Session expired or invalid. Please sign in again." });
     return;
   }
   req.authUser = payload;
+  req.authTokenRaw = token;
   next();
 }
-
-// src/server/repository.ts
-import crypto3 from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
-
-// src/server/seedData.ts
-import crypto2 from "node:crypto";
-function isoDaysFromNow(offsetDays) {
-  const d = /* @__PURE__ */ new Date();
-  d.setUTCDate(d.getUTCDate() + offsetDays);
-  return d.toISOString().slice(0, 10);
+function isUserAdminRole(user) {
+  if (user.email === "chambers@vidhios.in") return false;
+  return Boolean(
+    user.isAdmin || user.role?.toLowerCase() === "admin" || user.role?.toLowerCase() === "administrator" || user.email === "vidhios@admin.com"
+  );
 }
-function buildSeededWorkspace(userId) {
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const mLitigationId = crypto2.randomUUID();
-  const mCorpId = crypto2.randomUUID();
-  const mGlobalId = crypto2.randomUUID();
-  const matters = [
-    {
-      id: mLitigationId,
-      userId,
-      title: "State of Maharashtra v. Vikramaditya Kulkarni",
-      matterCode: "BOM-HC-2026-418",
-      clientName: "Vikramaditya Kulkarni (Director, Apex InfraTech)",
-      opposingParty: "State of Maharashtra & EOW Mumbai",
-      jurisdiction: "india_litigation",
-      forum: "High Court of Judicature at Bombay (Criminal Appellate Side)",
-      status: "pending_hearing",
-      summaryFacts: "Anticipatory bail & quashing matter arising out of commercial JV dispute given criminal colour by complainant. FIR registered on 14 Jan 2026 alleging offences of cheating and criminal breach of trust over \u20B94.8 Cr escrow milestone release. Civil arbitration already invoked on 02 Dec 2025 prior to FIR.",
-      createdAt: now,
-      updatedAt: now
-    },
-    {
-      id: mCorpId,
-      userId,
-      title: "Project Horizon \u2014 Acquisition & MSA Review (FinGrid Pvt. Ltd.)",
-      matterCode: "MA-DEL-2026-092",
-      clientName: "Kaveri Capital Partners LLP",
-      opposingParty: "FinGrid Payments Technologies Pvt. Ltd.",
-      jurisdiction: "corporate_ma",
-      forum: "Corporate M&A / Commercial Advisory (Mumbai & Bengaluru)",
-      status: "in_review",
-      summaryFacts: "Series B acquisition due diligence and vendor Master Services Agreement redlining for payment gateway infrastructure. Key exposure areas include uncapped IP indemnity, RBI PA/PG compliance warranties, unilateral termination rights, and arbitration seat alignment.",
-      createdAt: now,
-      updatedAt: now
-    },
-    {
-      id: mGlobalId,
-      userId,
-      title: "Meridian Renewables Pte. Ltd. v. Helios Grid GmbH",
-      matterCode: "SIAC-ARB-2026-114",
-      clientName: "Meridian Renewables Pte. Ltd. (Singapore)",
-      opposingParty: "Helios Grid GmbH (Munich)",
-      jurisdiction: "global_multi",
-      forum: "Singapore International Arbitration Centre (SIAC) \u2014 English Governing Law",
-      status: "active",
-      summaryFacts: "Cross-border solar turbine EPC delay dispute ($14.2M liquidated damages claim) governed by English law with Singapore seat and anticipated Part II foreign award enforcement against Indian subsidiary assets under Section 48 of the Arbitration & Conciliation Act, 1996.",
-      createdAt: now,
-      updatedAt: now
+function createRateLimiter(options) {
+  const buckets = /* @__PURE__ */ new Map();
+  return (req, res, next) => {
+    if (process.env.DISABLE_RATE_LIMIT === "true") {
+      next();
+      return;
     }
-  ];
-  const drafts = [
-    {
-      id: crypto2.randomUUID(),
-      matterId: mLitigationId,
-      userId,
-      title: "Anticipatory Bail Application \u2014 Bombay High Court",
-      docType: "Anticipatory Bail Application",
-      version: 2,
-      updatedAt: now,
-      content: `IN THE HIGH COURT OF JUDICATURE AT BOMBAY
-CRIMINAL APPELLATE JURISDICTION
-ANTICIPATORY BAIL APPLICATION NO. ______ OF 2026
-
-IN THE MATTER OF:
-Vikramaditya Kulkarni, Director, Apex InfraTech Pvt. Ltd. ... Applicant
-VERSUS
-The State of Maharashtra (through EOW, Mumbai) ... Respondent
-
-APPLICATION UNDER SECTION 438 CrPC FOR GRANT OF PRE-ARREST BAIL
-
-MOST RESPECTFULLY SHOWETH:
-
-1. That the Applicant is a law-abiding citizen and Director of Apex InfraTech Pvt. Ltd., having deep roots in society, and is apprehending arrest in FIR No. 41/2026 registered at Marine Drive Police Station (transferred to EOW) for alleged offences punishable under Section 420 IPC, Section 406 IPC, and Section 120B of the Indian Penal Code.
-
-2. That the entire dispute is purely commercial and civil in nature arising out of a Joint Venture Agreement dated 12.03.2024. The Applicant had already issued a Notice Invoking Arbitration on 02.12.2025, nearly six weeks prior to the lodging of the impugned FIR under Section 154 CrPC.
-
-3. That the Applicant has complied with every notice issued under Section 41A CrPC and has handed over complete digital ledger records accompanied by a certificate under Section 65B of the Indian Evidence Act.
-
-4. That custodial interrogation is wholly unnecessary as the prosecution case rests entirely on documentary and banking records already seized. The Applicant relies on the settled law laid down by the Hon'ble Supreme Court in Arnesh Kumar v. State of Bihar and Siddharam Satlingappa Mhetre.
-
-PRAYER
-It is therefore most humbly prayed that this Hon'ble Court may be pleased to direct that in the event of arrest in FIR No. 41/2026, the Applicant be released on bail on such terms and conditions as this Hon'ble Court deems fit.`
-    },
-    {
-      id: crypto2.randomUUID(),
-      matterId: mCorpId,
-      userId,
-      title: "Due Diligence Preliminary Requisition Note",
-      docType: "M&A Requisition Memo",
-      version: 1,
-      updatedAt: now,
-      content: `CONFIDENTIAL \u2014 ATTORNEY-CLIENT PRIVILEGED
-PROJECT HORIZON: PRELIMINARY LEGAL DUE DILIGENCE REQUISITIONS
-
-1. Regulatory Authorizations: Provide copies of RBI Payment Aggregator authorization letters, periodic CERT-In cybersecurity audit certificates (FY 2024-25 & 2025-26), and data localization compliance attestations.
-2. Material Customer Contracts: Disclose all top-10 enterprise MSAs containing uncapped consequential damages, change-of-control termination triggers, or exclusivity covenants.
-3. Pending Litigation & Tax Notices: Provide status of GST show-cause notice dated 18.08.2025 and any labour/ESOP disputes.`
-    }
-  ];
-  const researchMemos = [
-    {
-      id: crypto2.randomUUID(),
-      matterId: mLitigationId,
-      userId,
-      query: "Quashing and anticipatory bail when commercial breach is given criminal colour under BNS 318(4) / IPC 420",
-      jurisdiction: "india_litigation",
-      answerMarkdown: `### Executive Conclusion
-Indian Supreme Court precedent consistently deprecates converting civil or contractual disputes into criminal prosecutions for cheating (**Section 318(4) BNS**, formerly Section 420 IPC) or criminal breach of trust (**Section 316(2) BNS**, formerly Section 406 IPC) unless dishonest intention existed **at the very inception** of the transaction.
-
-### Controlling Precedents
-1. **Lalit Chaturvedi & Ors. v. State of Uttar Pradesh (2024 SCC OnLine SC 171)** \u2014 Mere breach of contract or unpaid commercial dues does not constitute cheating or criminal breach of trust; criminal proceedings cannot be used as a pressure tactic for recovery.
-2. **Delhi Race Club (1940) Ltd. v. State of Uttar Pradesh (2024 INSC 626)** \u2014 Clarified that cheating and criminal breach of trust are antithetical and cannot ordinarily co-exist on the same set of facts without distinct ingredients.
-3. **Arnesh Kumar v. State of Bihar (2014) 8 SCC 273** (now codified in **Section 35(3) BNSS**) \u2014 Mandatory written reasons before arrest for offences punishable up to 7 years.
-
-### Strategic Application to Matter
-- Highlight the **02.12.2025 Arbitration Notice** predating the **14.01.2026 FIR** to establish counter-blast mala fides.
-- Note that under **Section 316(2) BNS**, criminal breach of trust punishment increased from 3 years to 5 years, still squarely within the 7-year threshold attracting Section 35(3) BNSS safeguards.`,
-      citations: [
-        {
-          title: "Delhi Race Club (1940) Ltd. v. State of Uttar Pradesh \u2014 Supreme Court of India (2024)",
-          url: "https://main.sci.gov.in/",
-          courtOrSource: "Supreme Court of India",
-          status: "verified_web"
-        },
-        {
-          title: "Bharatiya Nyaya Sanhita, 2023 \u2014 Sections 316 & 318",
-          url: "https://www.indiacode.nic.in/",
-          courtOrSource: "India Code (Central Act)",
-          status: "statute"
+    const now = Date.now();
+    const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "unknown";
+    const key = `${options.keyPrefix}:${ip}`;
+    const existing = buckets.get(key);
+    if (!existing || now > existing.resetAt) {
+      buckets.set(key, { count: 1, resetAt: now + options.windowMs });
+      if (buckets.size > 5e3) {
+        for (const [k, v] of buckets.entries()) {
+          if (now > v.resetAt) buckets.delete(k);
         }
-      ],
-      citationIntegrity: {
-        verifiedSourceCount: 2,
-        jurisdictionChecked: "Indian Criminal & Supreme Court Jurisprudence",
-        bnsComplianceNote: "Cross-verified against BNS 2023 & BNSS 2023 equivalents.",
-        confidenceLabel: "Grounded via Web & Statute"
-      },
-      createdAt: now
+      }
+      next();
+      return;
     }
-  ];
-  const vaultDocuments = [
-    {
-      id: crypto2.randomUUID(),
-      matterId: mLitigationId,
-      userId,
-      fileName: "FIR_41_2026_MarineDrive_OCR.pdf",
-      mimeType: "application/pdf",
-      docCategory: "FIR / Police Record",
-      extractedText: "First Information Report No. 41/2026 dated 14.01.2026. Informant alleges \u20B94.80 Cr paid in March 2024 towards JV project in Thane was diverted. Informant claims no prior dispute existed before January 2026.",
-      translatedText: "\u092A\u094D\u0930\u0925\u092E \u0938\u0942\u091A\u0928\u093E \u0930\u093F\u092A\u094B\u0930\u094D\u091F \u0938\u0902\u0916\u094D\u092F\u093E 41/2026 \u0926\u093F\u0928\u093E\u0902\u0915 14.01.2026\u0964 \u0936\u093F\u0915\u093E\u092F\u0924\u0915\u0930\u094D\u0924\u093E \u0915\u093E \u0906\u0930\u094B\u092A \u0939\u0948 \u0915\u093F \u0920\u093E\u0923\u0947 \u092E\u0947\u0902 \u0938\u0902\u092F\u0941\u0915\u094D\u0924 \u0909\u0926\u094D\u092F\u092E \u092A\u0930\u093F\u092F\u094B\u091C\u0928\u093E \u0915\u0947 \u0932\u093F\u090F \u092E\u093E\u0930\u094D\u091A 2024 \u092E\u0947\u0902 \u092D\u0941\u0917\u0924\u093E\u0928 \u0915\u093F\u090F \u0917\u090F \u20B94.80 \u0915\u0930\u094B\u0921\u093C \u0915\u0940 \u0930\u093E\u0936\u093F \u0915\u093E \u0926\u0941\u0930\u0941\u092A\u092F\u094B\u0917 \u0915\u093F\u092F\u093E \u0917\u092F\u093E\u0964",
-      targetLanguage: "Hindi",
-      chronology: [
-        {
-          date: "2024-03-12",
-          event: "Execution of Joint Venture Agreement between Apex InfraTech and Complainant",
-          sourceDoc: "JV_Agreement_2024.pdf",
-          significance: "Establishes commercial arbitration clause (Clause 19.2) and milestone escrow."
-        },
-        {
-          date: "2025-12-02",
-          event: "Applicant served Section 21 Notice Invoking Arbitration demanding reconciliation",
-          sourceDoc: "Sec21_Notice_Dec2025.pdf",
-          significance: "Proves prior civil dispute six weeks before criminal complaint."
-        },
-        {
-          date: "2026-01-14",
-          event: "FIR No. 41/2026 lodged at Marine Drive PS alleging cheating & breach of trust",
-          sourceDoc: "FIR_41_2026_MarineDrive_OCR.pdf",
-          significance: "Trigger date for pre-arrest bail and Section 528 BNSS quashing petition."
-        }
-      ],
-      contradictions: [
-        {
-          topic: "Existence of Prior Commercial Dispute",
-          statementA: 'FIR Para 6 states: "No written dispute or notice was exchanged prior to January 2026."',
-          statementB: "Speed Post tracking & Email Annexure C confirm receipt of Applicant\u2019s Arbitration Notice on 03.12.2025.",
-          severity: "high",
-          recommendation: "Highlight material suppression of facts under Bhajan Lal guidelines to seek interim protection and quashing."
-        }
-      ],
-      createdAt: now
+    existing.count += 1;
+    if (existing.count > options.maxRequests) {
+      const retryAfterSec = Math.max(1, Math.ceil((existing.resetAt - now) / 1e3));
+      res.setHeader("Retry-After", String(retryAfterSec));
+      res.status(429).json({
+        error: `Too many requests. Please retry in ${retryAfterSec}s.`
+      });
+      return;
     }
-  ];
-  const contractReviews = [
-    {
-      id: crypto2.randomUUID(),
-      matterId: mCorpId,
-      userId,
-      title: "FinGrid Enterprise Master Services Agreement (v3.2 Vendor Draft)",
-      playbook: "Indian Corporate & Arbitration Act Playbook",
-      sourceText: `CLAUSE 8.2 INDEMNIFICATION: Customer shall indemnify, defend, and hold harmless Vendor against any and all third-party claims, direct, indirect, incidental, or consequential losses arising out of Customer's use of the Platform without any monetary cap.
-CLAUSE 11.1 TERMINATION FOR CONVENIENCE: Vendor may terminate this Agreement at any time upon 7 days written notice without refund of prepaid annual fees.
-CLAUSE 14.3 GOVERNING LAW & DISPUTE RESOLUTION: This Agreement shall be governed by the laws of India. Any dispute shall be resolved by a sole arbitrator appointed exclusively by Vendor's Managing Director, with seat in Delhi.`,
-      summary: "High commercial risk profile: Vendor draft imposes asymmetric uncapped liability on Customer, allows unilateral forfeiture of prepaid fees on 7-day termination, and includes a legally unenforceable unilateral arbitrator appointment clause under Perkins Eastman Architects v. HSCC (India) Ltd.",
-      clauses: [
-        {
-          id: "cl_indemnity_8_2",
-          clauseRef: "Clause 8.2",
-          title: "Uncapped Asymmetric Indemnification",
-          severity: "high",
-          issueSummary: "Imposes uncapped indemnification including indirect and consequential damages on Customer.",
-          originalText: "Customer shall indemnify, defend, and hold harmless Vendor against any and all third-party claims, direct, indirect, incidental, or consequential losses arising out of Customer's use of the Platform without any monetary cap.",
-          proposedText: "Each Party shall indemnify the other solely for direct, finally awarded third-party damages arising from gross negligence, willful misconduct, or third-party IP infringement, excluding indirect or consequential losses, and capped at 100% of fees paid in the preceding twelve (12) months.",
-          legalRationale: "Under Section 73 of the Indian Contract Act, 1872, remote or indirect damages are generally excluded unless explicitly assumed; uncapped consequential indemnity creates uninsurable M&A balance-sheet exposure.",
-          decision: "pending"
-        },
-        {
-          id: "cl_arb_14_3",
-          clauseRef: "Clause 14.3",
-          title: "Invalid Unilateral Arbitrator Appointment",
-          severity: "high",
-          issueSummary: "Sole arbitrator appointed solely by Vendor's Managing Director is void under Section 12(5) Arbitration Act.",
-          originalText: "Any dispute shall be resolved by a sole arbitrator appointed exclusively by Vendor's Managing Director, with seat in Delhi.",
-          proposedText: "Any dispute shall be finally resolved by arbitration under the Arbitration and Conciliation Act, 1996 before a sole arbitrator mutually appointed by both Parties (or failing agreement within 30 days, by the Mumbai Centre for International Arbitration), with seat and venue in Mumbai.",
-          legalRationale: "Unilateral appointment by an interested party violates Section 12(5) read with Seventh Schedule (Perkins Eastman Architects DPC v. HSCC (India) Ltd., 2019; Central Organisation for Railway Electrification, 2024 Constitution Bench).",
-          decision: "pending"
-        },
-        {
-          id: "cl_term_11_1",
-          clauseRef: "Clause 11.1",
-          title: "Unilateral 7-Day Termination Without Pro-Rata Refund",
-          severity: "medium",
-          issueSummary: "Allows Vendor to terminate for convenience on 7 days notice while retaining prepaid annual fees.",
-          originalText: "Vendor may terminate this Agreement at any time upon 7 days written notice without refund of prepaid annual fees.",
-          proposedText: "Either Party may terminate for convenience upon ninety (90) days prior written notice; if Vendor terminates without cause, Vendor shall refund all prepaid, unearned fees on a pro-rata basis within fifteen (15) business days and provide transition assistance.",
-          legalRationale: "For critical payment gateway infrastructure, 7 days notice causes operational disruption and unfair forfeiture of consideration.",
-          decision: "pending"
-        }
-      ],
-      requisitions: [
-        "Obtain FinGrid Board Resolution & RBI Payment Aggregator authorization certificate.",
-        "Confirm whether existing customer MSAs contain unilateral arbitration clauses requiring amendment prior to closing.",
-        "Verify cyber insurance policy limit (minimum \u20B925 Cr recommended to backstop Vendor IP & data breach indemnity)."
-      ],
-      createdAt: now
-    }
-  ];
-  const courtroomSessions = [
-    {
-      id: crypto2.randomUUID(),
-      matterId: mLitigationId,
-      userId,
-      mode: "bench",
-      forumContext: "Bombay High Court \u2014 Single Judge Criminal Bail Bench",
-      briefExcerpt: "Anticipatory Bail in FIR No. 41/2026 alleging cheating & criminal breach of trust over \u20B94.8 Cr JV escrow.",
-      vulnerabilities: [
-        "Bench may ask why the Applicant did not deposit a security bond or escrow statement showing utilization of the \u20B94.8 Cr.",
-        "Ensure exact distinction between Section 318(4) BNS and Section 316(2) BNS per Delhi Race Club (2024) is framed succinctly."
-      ],
-      turns: [
-        {
-          id: crypto2.randomUUID(),
-          speaker: "bench",
-          message: "Counsel, the EOW remand note claims \u20B94.80 Crore was transferred to a sister entity within 48 hours of milestone release. Why shouldn\u2019t custodial interrogation be permitted to trace the money trail?",
-          weaknessFlag: "Money-trail tracing argument is the prosecution\u2019s strongest point against pre-arrest bail.",
-          suggestedRebuttal: "My Lord, every single rupee moved strictly through RTGS banking channels to the designated EPC subcontractor named in Schedule III of the JV Agreement. Complete audited bank statements and BSA Section 63 certificates are already tendered to the IO on 22.01.2026; nothing remains to be discovered through custody.",
-          authorities: [
-            "Lalit Chaturvedi v. State of U.P. (2024 SCC OnLine SC 171)",
-            "Arnesh Kumar v. State of Bihar (2014) 8 SCC 273 / Sec. 35(3) BNSS"
-          ],
-          timestamp: now
-        }
-      ],
-      createdAt: now
-    }
-  ];
-  const trackedCases = [
-    {
-      id: crypto2.randomUUID(),
-      matterId: mLitigationId,
-      userId,
-      caseNumber: "ABA/418/2026",
-      cnrNumber: "MHHC010094822026",
-      court: "Bombay High Court",
-      courtroom: "Court Room 34",
-      bench: "Hon\u2019ble Justice R. K. Deshmukh",
-      causeListItem: "Sr. No. 18 (Urgent Admission)",
-      nextHearingDate: isoDaysFromNow(2),
-      stage: "Interim Protection & IO Reply",
-      status: "listed",
-      notes: "Keep Section 21 Arbitration Notice speed-post receipt and BNS/BNSS citation chart ready.",
-      createdAt: now
-    },
-    {
-      id: crypto2.randomUUID(),
-      matterId: mGlobalId,
-      userId,
-      caseNumber: "ARB/114/2026/SIAC",
-      cnrNumber: "SIAC-2026-114-SG",
-      court: "SIAC Tribunal (Singapore)",
-      courtroom: "Maxwell Chambers Suite 4",
-      bench: "Presiding Arbitrator M. Tan SC",
-      causeListItem: "Procedural Hearing #2",
-      nextHearingDate: isoDaysFromNow(9),
-      stage: "Document Production & Redfern Schedule",
-      status: "listed",
-      notes: "Exchange Redfern Schedule objections 72 hours prior to procedural hearing.",
-      createdAt: now
-    },
-    {
-      id: crypto2.randomUUID(),
-      matterId: mCorpId,
-      userId,
-      caseNumber: "CP(IB)/209/MB/2026",
-      cnrNumber: "NCLTMUM002092026",
-      court: "NCLT Mumbai Bench",
-      courtroom: "Court II",
-      bench: "Hon\u2019ble Member (J) S. Verma",
-      causeListItem: "Sr. No. 42 (Ordinary List)",
-      nextHearingDate: isoDaysFromNow(14),
-      stage: "Scheme Merger Compliance Check",
-      status: "in_session",
-      notes: "Track creditor NOC affidavit filing status before closing.",
-      createdAt: now
-    }
-  ];
-  const deadlines = [
-    {
-      id: crypto2.randomUUID(),
-      matterId: mLitigationId,
-      userId,
-      title: "File Rejoinder Affidavit & BSA Sec. 63 Certificate",
-      statuteArticle: "Bombay HC Criminal Appellate Rules",
-      triggerDate: isoDaysFromNow(-7),
-      dueDate: isoDaysFromNow(1),
-      completed: false,
-      notes: "Serve advance copy on APP office before 4:00 PM.",
-      createdAt: now
-    },
-    {
-      id: crypto2.randomUUID(),
-      matterId: mGlobalId,
-      userId,
-      title: "Potential Section 34 Award Challenge Outer Window",
-      statuteArticle: "Arbitration & Conciliation Act, Sec. 34(3)",
-      triggerDate: isoDaysFromNow(-45),
-      dueDate: isoDaysFromNow(45),
-      graceDate: isoDaysFromNow(75),
-      completed: false,
-      notes: "Strict 3 months + 30 days non-extendable statutory window.",
-      createdAt: now
-    }
-  ];
-  const meetingBriefs = [
-    {
-      id: crypto2.randomUUID(),
-      matterId: mLitigationId,
-      userId,
-      title: "Client Consultation \u2014 Vikramaditya Kulkarni (Pre-Hearing Strategy)",
-      durationLabel: "18:42",
-      transcript: "Client confirmed all \u20B94.8 Cr transfers went to certified EPC subcontractors via RTGS. Client also located the signed WhatsApp confirmation from complainant acknowledging project delay due to municipal clearance.",
-      summary: "Pre-hearing consultation confirming complete banking trail for escrow utilization and newly surfaced electronic admissions from the complainant negating dishonest intent at inception.",
-      keyFacts: [
-        "All \u20B94.8 Cr milestone disbursements cleared via RTGS to approved EPC subcontractors.",
-        "Complainant acknowledged municipal clearance delay via WhatsApp on 11.10.2025.",
-        "Applicant appeared before EOW on 19.01.2026 and 28.01.2026 pursuant to notice."
-      ],
-      actionItems: [
-        "Prepare Section 63 BSA electronic evidence certificate (with forensic expert co-signature) for WhatsApp admissions.",
-        "Attach audited RTGS ledger extract as Annexure D to the Rejoinder Affidavit."
-      ],
-      statutoryIssues: [
-        "Section 63 Bharatiya Sakshya Adhiniyam, 2023 (Electronic Record Certificate)",
-        "Section 318(4) BNS vs civil breach of contract threshold"
-      ],
-      createdAt: now
-    }
-  ];
-  const whatsappMessages = [
-    {
-      id: crypto2.randomUUID(),
-      matterId: mLitigationId,
-      userId,
-      sender: "assistant",
-      body: "VidhiOS Command Center synced. Type /hearings, /bns 420, /cases, /deadlines, /remind <task>, or /brief to manage your chambers directly.",
-      commandTag: "system",
-      createdAt: now
-    }
-  ];
-  return {
-    matters,
-    researchMemos,
-    drafts,
-    vaultDocuments,
-    contractReviews,
-    courtroomSessions,
-    trackedCases,
-    deadlines,
-    meetingBriefs,
-    whatsappMessages
+    next();
   };
 }
 
-// src/server/neonDatabase.ts
-import { Pool } from "pg";
-var activePool = null;
-var resolvedHostIp = null;
-function getNeonConnectionString() {
-  const url = (process.env.DATABASE_URL || process.env.NEON_DATABASE_URL || "").trim();
-  if (!url || url === "MY_DATABASE_URL" || url === "MY_NEON_DATABASE_URL" || url === "postgresql://...") {
-    return "";
-  }
-  return url;
-}
-function isNeonConfigured() {
-  return Boolean(getNeonConnectionString());
-}
-async function resolveHostViaDoH(hostname) {
-  if (resolvedHostIp) return resolvedHostIp;
-  if (process.env.NETLIFY || process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.NODE_ENV === "production") {
-    return null;
-  }
-  try {
-    const res = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=A`, {
-      headers: { Accept: "application/dns-json" },
-      signal: AbortSignal.timeout(2e3)
-    });
-    if (!res.ok) return null;
-    const json = await res.json();
-    const ip = json.Answer?.find((a) => a.type === 1)?.data;
-    if (ip) {
-      resolvedHostIp = ip;
-      return ip;
-    }
-  } catch {
-  }
-  return null;
-}
-async function getNeonPool() {
-  const connectionString = getNeonConnectionString();
-  if (!connectionString) return null;
-  if (activePool) return activePool;
-  try {
-    const parsed = new URL(connectionString);
-    const hostname = parsed.hostname;
-    const ip = await resolveHostViaDoH(hostname);
-    activePool = new Pool({
-      host: ip || hostname,
-      port: Number(parsed.port) || 5432,
-      user: decodeURIComponent(parsed.username),
-      password: decodeURIComponent(parsed.password),
-      database: parsed.pathname.replace(/^\//, "") || "neondb",
-      ssl: {
-        servername: hostname,
-        rejectUnauthorized: false
-      },
-      max: 10,
-      idleTimeoutMillis: 3e4,
-      connectionTimeoutMillis: 8e3
-    });
-    activePool.on("error", (err) => {
-      console.error("[Neon Pool Error]:", err.message);
-    });
-    return activePool;
-  } catch (err) {
-    console.error("[Neon Pool Init Failed]:", err);
-    return null;
-  }
-}
-async function testNeonConnection() {
-  const startedAt = Date.now();
-  const pool = await getNeonPool();
-  if (!pool) {
-    return { ok: false, error: "DATABASE_URL or NEON_DATABASE_URL is not configured." };
-  }
-  let client = null;
-  try {
-    client = await pool.connect();
-    const res = await client.query("SELECT version() as version, current_database() as db, now() as current_time;");
-    return {
-      ok: true,
-      version: res.rows[0]?.version || "PostgreSQL (Neon Serverless)",
-      database: res.rows[0]?.db || "neondb",
-      latencyMs: Date.now() - startedAt
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : "Failed to connect to Neon database.",
-      latencyMs: Date.now() - startedAt
-    };
-  } finally {
-    client?.release();
-  }
-}
-var schemaInitialized = false;
-async function initNeonSchema(force = false) {
-  if (schemaInitialized && !force) return;
-  const pool = await getNeonPool();
-  if (!pool) return;
-  let client = null;
-  try {
-    client = await pool.connect();
-    await client.query('CREATE EXTENSION IF NOT EXISTS "pgcrypto";');
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id text PRIMARY KEY,
-        email text NOT NULL UNIQUE,
-        full_name text NOT NULL,
-        role text NOT NULL DEFAULT 'Advocate',
-        organization text DEFAULT '',
-        default_jurisdiction text NOT NULL DEFAULT 'india_litigation',
-        is_admin boolean DEFAULT false,
-        password_hash text NOT NULL,
-        created_at text NOT NULL
-      );
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS matters (
-        id text PRIMARY KEY,
-        user_id text NOT NULL,
-        title text NOT NULL,
-        matter_code text NOT NULL,
-        client_name text NOT NULL,
-        opposing_party text DEFAULT '',
-        jurisdiction text NOT NULL DEFAULT 'india_litigation',
-        forum text NOT NULL,
-        status text NOT NULL DEFAULT 'active',
-        summary_facts text DEFAULT '',
-        created_at text NOT NULL,
-        updated_at text NOT NULL
-      );
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS research_memos (
-        id text PRIMARY KEY,
-        matter_id text NOT NULL,
-        user_id text NOT NULL,
-        query text NOT NULL,
-        jurisdiction text NOT NULL,
-        answer_markdown text NOT NULL,
-        citations jsonb NOT NULL DEFAULT '[]'::jsonb,
-        citation_integrity jsonb NOT NULL DEFAULT '{}'::jsonb,
-        created_at text NOT NULL
-      );
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS drafts (
-        id text PRIMARY KEY,
-        matter_id text NOT NULL,
-        user_id text NOT NULL,
-        title text NOT NULL,
-        doc_type text NOT NULL,
-        content text NOT NULL,
-        version integer NOT NULL DEFAULT 1,
-        updated_at text NOT NULL
-      );
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS vault_documents (
-        id text PRIMARY KEY,
-        matter_id text NOT NULL,
-        user_id text NOT NULL,
-        file_name text NOT NULL,
-        mime_type text NOT NULL,
-        doc_category text NOT NULL DEFAULT 'Annexure',
-        extracted_text text DEFAULT '',
-        translated_text text DEFAULT '',
-        target_language text DEFAULT '',
-        chronology jsonb NOT NULL DEFAULT '[]'::jsonb,
-        contradictions jsonb NOT NULL DEFAULT '[]'::jsonb,
-        created_at text NOT NULL
-      );
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS contract_reviews (
-        id text PRIMARY KEY,
-        matter_id text NOT NULL,
-        user_id text NOT NULL,
-        title text NOT NULL,
-        playbook text NOT NULL,
-        source_text text NOT NULL,
-        summary text DEFAULT '',
-        clauses jsonb NOT NULL DEFAULT '[]'::jsonb,
-        requisitions jsonb NOT NULL DEFAULT '[]'::jsonb,
-        created_at text NOT NULL
-      );
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS courtroom_sessions (
-        id text PRIMARY KEY,
-        matter_id text NOT NULL,
-        user_id text NOT NULL,
-        mode text NOT NULL,
-        forum_context text NOT NULL,
-        brief_excerpt text NOT NULL,
-        turns jsonb NOT NULL DEFAULT '[]'::jsonb,
-        vulnerabilities jsonb NOT NULL DEFAULT '[]'::jsonb,
-        created_at text NOT NULL
-      );
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS tracked_cases (
-        id text PRIMARY KEY,
-        matter_id text NOT NULL,
-        user_id text NOT NULL,
-        case_number text NOT NULL,
-        court text NOT NULL,
-        courtroom text DEFAULT '',
-        bench text DEFAULT '',
-        cause_list_item text DEFAULT '',
-        next_hearing_date text NOT NULL,
-        stage text NOT NULL,
-        notes text DEFAULT '',
-        cnr_number text DEFAULT '',
-        status text NOT NULL DEFAULT 'listed',
-        created_at text NOT NULL,
-        updated_at text NOT NULL
-      );
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS deadlines (
-        id text PRIMARY KEY,
-        matter_id text NOT NULL,
-        user_id text NOT NULL,
-        title text NOT NULL,
-        statute_article text DEFAULT '',
-        trigger_date text NOT NULL,
-        due_date text NOT NULL,
-        grace_date text,
-        completed boolean NOT NULL DEFAULT false,
-        notes text DEFAULT '',
-        created_at text NOT NULL
-      );
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS assistant_messages (
-        id text PRIMARY KEY,
-        user_id text NOT NULL,
-        matter_id text,
-        role text NOT NULL,
-        content text NOT NULL,
-        language_used text NOT NULL DEFAULT 'en',
-        verification_mode text NOT NULL DEFAULT 'deterministic_verified',
-        confidence_note text DEFAULT '',
-        sources jsonb NOT NULL DEFAULT '[]'::jsonb,
-        completed_actions jsonb NOT NULL DEFAULT '[]'::jsonb,
-        created_at text NOT NULL
-      );
-    `);
-    console.log("[Neon PostgreSQL] Schema successfully verified & provisioned in neondb.");
-    schemaInitialized = true;
-  } catch (err) {
-    console.error("[Neon PostgreSQL] Schema verification error:", err);
-  } finally {
-    client?.release();
-  }
-}
-async function loadStoreFromNeon() {
-  const pool = await getNeonPool();
-  if (!pool) return null;
-  try {
-    const [
-      users,
-      matters,
-      researchMemos,
-      drafts,
-      vaultDocs,
-      contractReviews,
-      courtroomSessions,
-      trackedCases,
-      deadlines,
-      assistantMsgs
-    ] = await Promise.all([
-      pool.query("SELECT * FROM users;"),
-      pool.query("SELECT * FROM matters;"),
-      pool.query("SELECT * FROM research_memos;"),
-      pool.query("SELECT * FROM drafts;"),
-      pool.query("SELECT * FROM vault_documents;"),
-      pool.query("SELECT * FROM contract_reviews;"),
-      pool.query("SELECT * FROM courtroom_sessions;"),
-      pool.query("SELECT * FROM tracked_cases;"),
-      pool.query("SELECT * FROM deadlines;"),
-      pool.query("SELECT * FROM assistant_messages ORDER BY created_at ASC;")
-    ]);
-    if (users.rows.length === 0 && matters.rows.length === 0) {
-      return null;
-    }
-    return {
-      users: users.rows.map((u) => ({
-        id: u.id,
-        email: u.email,
-        fullName: u.full_name,
-        role: u.role,
-        organization: u.organization || "",
-        defaultJurisdiction: u.default_jurisdiction,
-        isAdmin: Boolean(u.is_admin),
-        passwordHash: u.password_hash,
-        createdAt: u.created_at
-      })),
-      matters: matters.rows.map((m) => ({
-        id: m.id,
-        userId: m.user_id,
-        title: m.title,
-        matterCode: m.matter_code,
-        clientName: m.client_name,
-        opposingParty: m.opposing_party || "",
-        jurisdiction: m.jurisdiction,
-        forum: m.forum,
-        status: m.status,
-        summaryFacts: m.summary_facts || "",
-        createdAt: m.created_at,
-        updatedAt: m.updated_at
-      })),
-      researchMemos: researchMemos.rows.map((r) => ({
-        id: r.id,
-        matterId: r.matter_id,
-        userId: r.user_id,
-        query: r.query,
-        jurisdiction: r.jurisdiction,
-        answerMarkdown: r.answer_markdown,
-        citations: r.citations,
-        citationIntegrity: r.citation_integrity,
-        createdAt: r.created_at
-      })),
-      drafts: drafts.rows.map((d) => ({
-        id: d.id,
-        matterId: d.matter_id,
-        userId: d.user_id,
-        title: d.title,
-        docType: d.doc_type,
-        content: d.content,
-        version: d.version,
-        updatedAt: d.updated_at
-      })),
-      vaultDocuments: vaultDocs.rows.map((v) => ({
-        id: v.id,
-        matterId: v.matter_id,
-        userId: v.user_id,
-        fileName: v.file_name,
-        mimeType: v.mime_type,
-        docCategory: v.doc_category,
-        extractedText: v.extracted_text,
-        translatedText: v.translated_text,
-        targetLanguage: v.target_language,
-        chronology: v.chronology,
-        contradictions: v.contradictions,
-        createdAt: v.created_at
-      })),
-      contractReviews: contractReviews.rows.map((c) => ({
-        id: c.id,
-        matterId: c.matter_id,
-        userId: c.user_id,
-        title: c.title,
-        playbook: c.playbook,
-        sourceText: c.source_text,
-        summary: c.summary,
-        clauses: c.clauses,
-        requisitions: c.requisitions,
-        createdAt: c.created_at
-      })),
-      courtroomSessions: courtroomSessions.rows.map((s) => ({
-        id: s.id,
-        matterId: s.matter_id,
-        userId: s.user_id,
-        mode: s.mode,
-        forumContext: s.forum_context,
-        briefExcerpt: s.brief_excerpt,
-        turns: s.turns,
-        vulnerabilities: s.vulnerabilities,
-        createdAt: s.created_at
-      })),
-      trackedCases: trackedCases.rows.map((t) => ({
-        id: t.id,
-        matterId: t.matter_id,
-        userId: t.user_id,
-        caseNumber: t.case_number,
-        court: t.court,
-        courtroom: t.courtroom,
-        bench: t.bench,
-        causeListItem: t.cause_list_item,
-        nextHearingDate: t.next_hearing_date,
-        stage: t.stage,
-        notes: t.notes,
-        cnrNumber: t.cnr_number,
-        status: t.status,
-        createdAt: t.created_at,
-        updatedAt: t.updated_at
-      })),
-      deadlines: deadlines.rows.map((dl) => ({
-        id: dl.id,
-        matterId: dl.matter_id,
-        userId: dl.user_id,
-        title: dl.title,
-        statuteArticle: dl.statute_article || "",
-        triggerDate: dl.trigger_date || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
-        dueDate: dl.due_date,
-        graceDate: dl.grace_date || void 0,
-        completed: Boolean(dl.completed),
-        notes: dl.notes || "",
-        createdAt: dl.created_at || (/* @__PURE__ */ new Date()).toISOString()
-      })),
-      meetingBriefs: [],
-      whatsappMessages: [],
-      assistantMessages: assistantMsgs.rows.map((a) => ({
-        id: a.id,
-        userId: a.user_id,
-        matterId: a.matter_id,
-        role: a.role,
-        content: a.content,
-        languageUsed: a.language_used,
-        verificationMode: a.verification_mode,
-        confidenceNote: a.confidence_note,
-        sources: a.sources,
-        completedActions: a.completed_actions,
-        createdAt: a.created_at
-      }))
-    };
-  } catch (err) {
-    console.error("[Neon PostgreSQL] Failed to load store from Neon database:", err);
-    return null;
-  }
-}
-async function persistStoreToNeon(state) {
-  const pool = await getNeonPool();
-  if (!pool) return;
-  let client = null;
-  try {
-    client = await pool.connect();
-    for (const u of state.users) {
-      await client.query(
-        `INSERT INTO users (id, email, full_name, role, organization, default_jurisdiction, is_admin, password_hash, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (email) DO UPDATE SET
-           full_name = EXCLUDED.full_name,
-           role = EXCLUDED.role,
-           organization = EXCLUDED.organization,
-           default_jurisdiction = EXCLUDED.default_jurisdiction,
-           is_admin = EXCLUDED.is_admin,
-           password_hash = EXCLUDED.password_hash;`,
-        [u.id, u.email, u.fullName, u.role, u.organization, u.defaultJurisdiction, Boolean(u.isAdmin), u.passwordHash, u.createdAt]
-      );
-    }
-    for (const m of state.matters) {
-      await client.query(
-        `INSERT INTO matters (id, user_id, title, matter_code, client_name, opposing_party, jurisdiction, forum, status, summary_facts, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-         ON CONFLICT (id) DO UPDATE SET
-           title = EXCLUDED.title,
-           opposing_party = EXCLUDED.opposing_party,
-           status = EXCLUDED.status,
-           summary_facts = EXCLUDED.summary_facts,
-           updated_at = EXCLUDED.updated_at;`,
-        [m.id, m.userId, m.title, m.matterCode, m.clientName, m.opposingParty, m.jurisdiction, m.forum, m.status, m.summaryFacts, m.createdAt, m.updatedAt]
-      );
-    }
-    for (const d of state.drafts) {
-      await client.query(
-        `INSERT INTO drafts (id, matter_id, user_id, title, doc_type, content, version, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (id) DO UPDATE SET
-           title = EXCLUDED.title,
-           content = EXCLUDED.content,
-           version = EXCLUDED.version,
-           updated_at = EXCLUDED.updated_at;`,
-        [d.id, d.matterId, d.userId, d.title, d.docType, d.content, d.version, d.updatedAt]
-      );
-    }
-    for (const r of state.researchMemos) {
-      await client.query(
-        `INSERT INTO research_memos (id, matter_id, user_id, query, jurisdiction, answer_markdown, citations, citation_integrity, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (id) DO NOTHING;`,
-        [r.id, r.matterId, r.userId, r.query, r.jurisdiction, r.answerMarkdown, JSON.stringify(r.citations), JSON.stringify(r.citationIntegrity), r.createdAt]
-      );
-    }
-    for (const v of state.vaultDocuments) {
-      await client.query(
-        `INSERT INTO vault_documents (id, matter_id, user_id, file_name, mime_type, doc_category, extracted_text, translated_text, target_language, chronology, contradictions, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-         ON CONFLICT (id) DO NOTHING;`,
-        [v.id, v.matterId, v.userId, v.fileName, v.mimeType, v.docCategory, v.extractedText, v.translatedText || "", v.targetLanguage || "", JSON.stringify(v.chronology), JSON.stringify(v.contradictions), v.createdAt]
-      );
-    }
-    for (const dl of state.deadlines) {
-      await client.query(
-        `INSERT INTO deadlines (id, matter_id, user_id, title, statute_article, trigger_date, due_date, grace_date, completed, notes, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-         ON CONFLICT (id) DO UPDATE SET
-           completed = EXCLUDED.completed,
-           notes = EXCLUDED.notes;`,
-        [dl.id, dl.matterId, dl.userId, dl.title, dl.statuteArticle || "", dl.triggerDate, dl.dueDate, dl.graceDate || null, dl.completed, dl.notes || "", dl.createdAt]
-      );
-    }
-    for (const cr of state.contractReviews) {
-      await client.query(
-        `INSERT INTO contract_reviews (id, matter_id, user_id, title, playbook, source_text, summary, clauses, requisitions, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (id) DO UPDATE SET
-           clauses = EXCLUDED.clauses,
-           summary = EXCLUDED.summary;`,
-        [cr.id, cr.matterId, cr.userId, cr.title, cr.playbook, cr.sourceText, cr.summary, JSON.stringify(cr.clauses), JSON.stringify(cr.requisitions), cr.createdAt]
-      );
-    }
-    for (const cs of state.courtroomSessions) {
-      await client.query(
-        `INSERT INTO courtroom_sessions (id, matter_id, user_id, mode, forum_context, brief_excerpt, turns, vulnerabilities, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (id) DO UPDATE SET
-           turns = EXCLUDED.turns,
-           vulnerabilities = EXCLUDED.vulnerabilities;`,
-        [cs.id, cs.matterId, cs.userId, cs.mode, cs.forumContext, cs.briefExcerpt, JSON.stringify(cs.turns), JSON.stringify(cs.vulnerabilities), cs.createdAt]
-      );
-    }
-    for (const tc of state.trackedCases) {
-      await client.query(
-        `INSERT INTO tracked_cases (id, matter_id, user_id, case_number, court, courtroom, bench, cause_list_item, next_hearing_date, stage, notes, cnr_number, status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-         ON CONFLICT (id) DO UPDATE SET
-           status = EXCLUDED.status,
-           next_hearing_date = EXCLUDED.next_hearing_date,
-           stage = EXCLUDED.stage,
-           notes = EXCLUDED.notes,
-           updated_at = EXCLUDED.updated_at;`,
-        [tc.id, tc.matterId, tc.userId, tc.caseNumber, tc.court, tc.courtroom || "", tc.bench || "", tc.causeListItem || "", tc.nextHearingDate, tc.stage, tc.notes || "", tc.cnrNumber || "", tc.status, tc.createdAt, tc.createdAt]
-      );
-    }
-    for (const am of state.assistantMessages) {
-      await client.query(
-        `INSERT INTO assistant_messages (id, user_id, matter_id, role, content, language_used, verification_mode, confidence_note, sources, completed_actions, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-         ON CONFLICT (id) DO NOTHING;`,
-        [am.id, am.userId, am.matterId, am.role, am.content, am.languageUsed, am.verificationMode, am.confidenceNote || "", JSON.stringify(am.sources), JSON.stringify(am.completedActions), am.createdAt]
-      );
-    }
-  } catch (err) {
-    console.error("[Neon PostgreSQL] Failed to sync store snapshot:", err);
-  } finally {
-    client?.release();
-  }
-}
-async function deleteUserFromNeon(userId) {
-  const pool = await getNeonPool();
-  if (!pool) return;
-  try {
-    await Promise.all([
-      pool.query("DELETE FROM assistant_messages WHERE user_id = $1;", [userId]),
-      pool.query("DELETE FROM deadlines WHERE user_id = $1;", [userId]),
-      pool.query("DELETE FROM tracked_cases WHERE user_id = $1;", [userId]),
-      pool.query("DELETE FROM courtroom_sessions WHERE user_id = $1;", [userId]),
-      pool.query("DELETE FROM contract_reviews WHERE user_id = $1;", [userId]),
-      pool.query("DELETE FROM vault_documents WHERE user_id = $1;", [userId]),
-      pool.query("DELETE FROM research_memos WHERE user_id = $1;", [userId]),
-      pool.query("DELETE FROM drafts WHERE user_id = $1;", [userId]),
-      pool.query("DELETE FROM matters WHERE user_id = $1;", [userId]),
-      pool.query("DELETE FROM users WHERE id = $1;", [userId])
-    ]);
-  } catch (err) {
-    console.error("[Neon PostgreSQL] Failed to delete user:", err);
-  }
-}
-async function deleteMatterFromNeon(matterId) {
-  const pool = await getNeonPool();
-  if (!pool) return;
-  try {
-    await Promise.all([
-      pool.query("DELETE FROM deadlines WHERE matter_id = $1;", [matterId]),
-      pool.query("DELETE FROM tracked_cases WHERE matter_id = $1;", [matterId]),
-      pool.query("DELETE FROM courtroom_sessions WHERE matter_id = $1;", [matterId]),
-      pool.query("DELETE FROM contract_reviews WHERE matter_id = $1;", [matterId]),
-      pool.query("DELETE FROM vault_documents WHERE matter_id = $1;", [matterId]),
-      pool.query("DELETE FROM research_memos WHERE matter_id = $1;", [matterId]),
-      pool.query("DELETE FROM drafts WHERE matter_id = $1;", [matterId]),
-      pool.query("DELETE FROM matters WHERE id = $1;", [matterId])
-    ]);
-  } catch (err) {
-    console.error("[Neon PostgreSQL] Failed to delete matter:", err);
-  }
-}
+// src/server/extendedRoutes.ts
+import { z } from "zod";
 
-// src/server/repository.ts
-var DATA_DIR = path.resolve(process.cwd(), "data");
-var STORE_PATH = path.join(DATA_DIR, "vidhios-store.json");
-var EMPTY_STATE = {
-  users: [],
-  matters: [],
-  researchMemos: [],
-  drafts: [],
-  vaultDocuments: [],
-  contractReviews: [],
-  courtroomSessions: [],
-  trackedCases: [],
-  deadlines: [],
-  meetingBriefs: [],
-  whatsappMessages: [],
-  assistantMessages: []
-};
-var WorkspaceRepository = class {
-  constructor() {
-    this.writeQueue = Promise.resolve();
-    this.readyPromise = null;
-    this.state = this.loadState();
-    if (isNeonConfigured()) {
-      this.engine = "neon";
-      this.readyPromise = this.initNeonAsync();
-    } else if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
-      this.engine = "supabase";
-      this.readyPromise = Promise.resolve();
-      this.ensureDemoAccount();
-      this.ensureDefaultAdminAccount();
-    } else {
-      this.engine = "local_durable";
-      this.readyPromise = Promise.resolve();
-      this.ensureDemoAccount();
-      this.ensureDefaultAdminAccount();
-    }
-  }
-  async ensureReady(forceReload = false) {
-    if (this.readyPromise) {
-      await this.readyPromise;
-    }
-    if (this.engine === "neon" && forceReload) {
-      try {
-        const remote = await loadStoreFromNeon();
-        if (remote && remote.users.length > 0) {
-          this.state = remote;
-          this.ensureDemoAccount();
-          this.ensureDefaultAdminAccount();
-        }
-      } catch (err) {
-        console.error("[Neon] Background reload error:", err);
-      }
-    }
-  }
-  async initNeonAsync() {
-    try {
-      await initNeonSchema();
-      const remoteState = await loadStoreFromNeon();
-      if (remoteState && remoteState.users.length > 0) {
-        this.state = remoteState;
-        this.ensureDemoAccount();
-        this.ensureDefaultAdminAccount();
-        console.log("[Neon] Repository synchronized with remote Neon PostgreSQL.");
-      } else {
-        this.ensureDemoAccount();
-        this.ensureDefaultAdminAccount();
-        await persistStoreToNeon(this.state);
-        console.log("[Neon] Initialized remote Neon PostgreSQL with chamber records.");
-      }
-    } catch (err) {
-      console.error("[Neon] Background sync error:", err);
-    }
-  }
-  loadState() {
-    try {
-      if (fs.existsSync(STORE_PATH)) {
-        const raw = fs.readFileSync(STORE_PATH, "utf8");
-        const parsed = JSON.parse(raw);
-        return {
-          users: parsed.users ?? [],
-          matters: parsed.matters ?? [],
-          researchMemos: parsed.researchMemos ?? [],
-          drafts: parsed.drafts ?? [],
-          vaultDocuments: parsed.vaultDocuments ?? [],
-          contractReviews: parsed.contractReviews ?? [],
-          courtroomSessions: parsed.courtroomSessions ?? [],
-          trackedCases: parsed.trackedCases ?? [],
-          deadlines: parsed.deadlines ?? [],
-          meetingBriefs: parsed.meetingBriefs ?? [],
-          whatsappMessages: parsed.whatsappMessages ?? [],
-          assistantMessages: parsed.assistantMessages ?? []
-        };
-      }
-    } catch (err) {
-      console.error("Failed to read local durable store; initializing clean state:", err);
-    }
-    return structuredClone(EMPTY_STATE);
-  }
-  async persist() {
-    const snapshot = JSON.stringify(this.state, null, 2);
-    this.writeQueue = this.writeQueue.then(async () => {
-      try {
-        await fs.promises.mkdir(DATA_DIR, { recursive: true });
-        const tmpPath = `${STORE_PATH}.${crypto3.randomBytes(6).toString("hex")}.tmp`;
-        await fs.promises.writeFile(tmpPath, snapshot, "utf8");
-        await fs.promises.rename(tmpPath, STORE_PATH);
-      } catch {
-      }
-      if (this.engine === "neon") {
-        await persistStoreToNeon(this.state).catch(
-          (e) => console.error("[Neon] Auto-persist error:", e)
-        );
-      }
-    }).catch((err) => {
-      console.error("Failed to persist store:", err);
-    });
-    await this.writeQueue;
-  }
-  toPublicUser(u) {
-    const { passwordHash: _ignored, ...profile } = u;
-    return profile;
-  }
-  seedForUser(userId) {
-    const seeded = buildSeededWorkspace(userId);
-    this.state.matters.push(...seeded.matters);
-    this.state.researchMemos.push(...seeded.researchMemos);
-    this.state.drafts.push(...seeded.drafts);
-    this.state.vaultDocuments.push(...seeded.vaultDocuments);
-    this.state.contractReviews.push(...seeded.contractReviews);
-    this.state.courtroomSessions.push(...seeded.courtroomSessions);
-    this.state.trackedCases.push(...seeded.trackedCases);
-    this.state.deadlines.push(...seeded.deadlines);
-    this.state.meetingBriefs.push(...seeded.meetingBriefs);
-    this.state.whatsappMessages.push(...seeded.whatsappMessages);
-  }
-  ensureDemoAccount() {
-    const demoEmail = "chambers@vidhios.in";
-    const existing = this.state.users.find((u) => u.email === demoEmail);
-    if (existing) {
-      if (!existing.isAdmin) {
-        existing.isAdmin = true;
-        this.persist();
-      }
-      return existing;
-    }
-    const demoUser = {
-      id: crypto3.randomUUID(),
-      email: demoEmail,
-      fullName: "Adv. Meera Deshmukh",
-      role: "Managing Partner",
-      organization: "Deshmukh & Associates Chambers",
-      defaultJurisdiction: "india_litigation",
-      isAdmin: true,
-      // Ephemeral strong server-only hash; accessed exclusively via explicit /api/auth/demo quick-start
-      passwordHash: hashPassword(crypto3.randomBytes(24).toString("hex")),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.users.push(demoUser);
-    this.seedForUser(demoUser.id);
-    this.persist();
-    return demoUser;
-  }
-  ensureDefaultAdminAccount() {
-    const adminEmail = "vidhios@admin.com";
-    const existing = this.state.users.find((u) => u.email === adminEmail);
-    if (existing) {
-      let changed = false;
-      if (!existing.isAdmin) {
-        existing.isAdmin = true;
-        changed = true;
-      }
-      if (!verifyPassword("Vidhios@2026", existing.passwordHash)) {
-        existing.passwordHash = hashPassword("Vidhios@2026");
-        changed = true;
-      }
-      if (changed) {
-        this.persist();
-      }
-      return existing;
-    }
-    const adminUser = {
-      id: crypto3.randomUUID(),
-      email: adminEmail,
-      fullName: "VidhiOS Administrator",
-      role: "Principal Legal Administrator",
-      organization: "VidhiOS Judiciary Chambers",
-      defaultJurisdiction: "india_litigation",
-      isAdmin: true,
-      passwordHash: hashPassword("Vidhios@2026"),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.users.push(adminUser);
-    this.seedForUser(adminUser.id);
-    this.persist();
-    return adminUser;
-  }
-  getDemoUser() {
-    return this.toPublicUser(this.ensureDemoAccount());
-  }
-  async registerUser(input) {
-    await this.ensureReady();
-    const normalizedEmail = input.email.trim().toLowerCase();
-    if (this.state.users.some((u) => u.email === normalizedEmail)) {
-      throw new Error("An account with this email already exists.");
-    }
-    const user = {
-      id: crypto3.randomUUID(),
-      email: normalizedEmail,
-      fullName: input.fullName.trim(),
-      role: input.role?.trim() || "Advocate",
-      organization: input.organization?.trim() || "Independent Chambers",
-      defaultJurisdiction: input.defaultJurisdiction ?? "india_litigation",
-      passwordHash: hashPassword(input.password),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.users.push(user);
-    this.seedForUser(user.id);
-    await this.persist();
-    return this.toPublicUser(user);
-  }
-  async authenticateUser(email, password) {
-    await this.ensureReady();
-    const normalizedEmail = email.trim().toLowerCase();
-    let user = this.state.users.find((u) => u.email === normalizedEmail);
-    if (!user && this.engine === "neon") {
-      await this.ensureReady(true);
-      user = this.state.users.find((u) => u.email === normalizedEmail);
-    }
-    if (!user) return null;
-    if (!verifyPassword(password, user.passwordHash)) return null;
-    return this.toPublicUser(user);
-  }
-  async getUserById(userId) {
-    await this.ensureReady();
-    let user = this.state.users.find((u) => u.id === userId);
-    if (!user && this.engine === "neon") {
-      await this.ensureReady(true);
-      user = this.state.users.find((u) => u.id === userId);
-    }
-    return user ? this.toPublicUser(user) : null;
-  }
-  getAllUsers() {
-    return this.state.users.map((u) => ({
-      ...this.toPublicUser(u),
-      mattersCount: this.state.matters.filter((m) => m.userId === u.id).length,
-      draftsCount: this.state.drafts.filter((d) => d.userId === u.id).length,
-      vaultCount: this.state.vaultDocuments.filter((v) => v.userId === u.id).length
-    }));
-  }
-  async adminCreateUser(input) {
-    await this.ensureReady();
-    const normalizedEmail = input.email.trim().toLowerCase();
-    if (this.state.users.some((u) => u.email === normalizedEmail)) {
-      throw new Error("An account with this email already exists.");
-    }
-    const user = {
-      id: crypto3.randomUUID(),
-      email: normalizedEmail,
-      fullName: input.fullName.trim(),
-      role: input.role?.trim() || "Advocate",
-      organization: input.organization?.trim() || "Independent Chambers",
-      defaultJurisdiction: input.defaultJurisdiction ?? "india_litigation",
-      isAdmin: Boolean(input.isAdmin),
-      passwordHash: hashPassword(input.password),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.users.push(user);
-    await this.persist();
-    return this.toPublicUser(user);
-  }
-  async adminUpdateUser(userId, input) {
-    await this.ensureReady();
-    const user = this.state.users.find((u) => u.id === userId);
-    if (!user) {
-      throw new Error("User not found.");
-    }
-    if (input.fullName !== void 0) user.fullName = input.fullName.trim();
-    if (input.organization !== void 0) user.organization = input.organization.trim();
-    if (input.role !== void 0) user.role = input.role.trim();
-    if (input.defaultJurisdiction !== void 0) user.defaultJurisdiction = input.defaultJurisdiction;
-    if (input.isAdmin !== void 0) user.isAdmin = Boolean(input.isAdmin);
-    await this.persist();
-    return this.toPublicUser(user);
-  }
-  async adminResetPassword(userId, newPassword) {
-    await this.ensureReady();
-    const user = this.state.users.find((u) => u.id === userId);
-    if (!user) {
-      throw new Error("User not found.");
-    }
-    if (!newPassword || newPassword.length < 8) {
-      throw new Error("Password must be at least 8 characters.");
-    }
-    user.passwordHash = hashPassword(newPassword);
-    await this.persist();
-  }
-  async adminDeleteUser(userId) {
-    await this.ensureReady();
-    const index = this.state.users.findIndex((u) => u.id === userId);
-    if (index === -1) {
-      throw new Error("User not found.");
-    }
-    this.state.users.splice(index, 1);
-    this.state.matters = this.state.matters.filter((m) => m.userId !== userId);
-    this.state.researchMemos = this.state.researchMemos.filter((r) => r.userId !== userId);
-    this.state.drafts = this.state.drafts.filter((d) => d.userId !== userId);
-    this.state.vaultDocuments = this.state.vaultDocuments.filter((v) => v.userId !== userId);
-    this.state.contractReviews = this.state.contractReviews.filter((c) => c.userId !== userId);
-    this.state.courtroomSessions = this.state.courtroomSessions.filter((s) => s.userId !== userId);
-    this.state.trackedCases = this.state.trackedCases.filter((t) => t.userId !== userId);
-    this.state.deadlines = this.state.deadlines.filter((d) => d.userId !== userId);
-    this.state.assistantMessages = this.state.assistantMessages.filter((a) => a.userId !== userId);
-    if (this.engine === "neon") {
-      await deleteUserFromNeon(userId);
-    }
-    await this.persist();
-  }
-  async getWorkspaceBundle(userId) {
-    await this.ensureReady();
-    let user = this.state.users.find((u) => u.id === userId);
-    if (!user && this.engine === "neon") {
-      await this.ensureReady(true);
-      user = this.state.users.find((u) => u.id === userId);
-    }
-    if (!user) return null;
-    return {
-      user: this.toPublicUser(user),
-      matters: this.state.matters.filter((m) => m.userId === userId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
-      researchMemos: this.state.researchMemos.filter((r) => r.userId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-      drafts: this.state.drafts.filter((d) => d.userId === userId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
-      vaultDocuments: this.state.vaultDocuments.filter((v) => v.userId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-      contractReviews: this.state.contractReviews.filter((c) => c.userId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-      courtroomSessions: this.state.courtroomSessions.filter((s) => s.userId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-      trackedCases: this.state.trackedCases.filter((tc) => tc.userId === userId).sort((a, b) => a.nextHearingDate.localeCompare(b.nextHearingDate)),
-      deadlines: this.state.deadlines.filter((dl) => dl.userId === userId).sort((a, b) => a.dueDate.localeCompare(b.dueDate)),
-      meetingBriefs: this.state.meetingBriefs.filter((mb) => mb.userId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-      whatsappMessages: this.state.whatsappMessages.filter((w) => w.userId === userId).sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
-      assistantMessages: this.state.assistantMessages.filter((a) => a.userId === userId).sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
-      storageEngine: this.engine
-    };
-  }
-  getMatterForUser(userId, matterId) {
-    return this.state.matters.find((m) => m.id === matterId && m.userId === userId);
-  }
-  createMatter(userId, input) {
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const matter = {
-      ...input,
-      id: crypto3.randomUUID(),
-      userId,
-      createdAt: now,
-      updatedAt: now
-    };
-    this.state.matters.unshift(matter);
-    this.persist();
-    return matter;
-  }
-  deleteMatter(userId, matterId) {
-    const exists = this.state.matters.some((m) => m.id === matterId && m.userId === userId);
-    if (!exists) return false;
-    this.state.matters = this.state.matters.filter((m) => !(m.id === matterId && m.userId === userId));
-    this.state.researchMemos = this.state.researchMemos.filter((r) => r.matterId !== matterId);
-    this.state.drafts = this.state.drafts.filter((d) => d.matterId !== matterId);
-    this.state.vaultDocuments = this.state.vaultDocuments.filter((v) => v.matterId !== matterId);
-    this.state.contractReviews = this.state.contractReviews.filter((c) => c.matterId !== matterId);
-    this.state.courtroomSessions = this.state.courtroomSessions.filter((s) => s.matterId !== matterId);
-    this.state.trackedCases = this.state.trackedCases.filter((tc) => tc.matterId !== matterId);
-    this.state.deadlines = this.state.deadlines.filter((dl) => dl.matterId !== matterId);
-    this.state.meetingBriefs = this.state.meetingBriefs.filter((mb) => mb.matterId !== matterId);
-    if (this.engine === "neon") {
-      void deleteMatterFromNeon(matterId);
-    }
-    this.persist();
-    return true;
-  }
-  addResearchMemo(memo) {
-    const created = {
-      ...memo,
-      id: crypto3.randomUUID(),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.researchMemos.unshift(created);
-    this.persist();
-    return created;
-  }
-  createDraft(userId, input) {
-    const created = {
-      id: crypto3.randomUUID(),
-      userId,
-      matterId: input.matterId,
-      title: input.title,
-      docType: input.docType,
-      content: input.content,
-      version: 1,
-      updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.drafts.unshift(created);
-    this.persist();
-    return created;
-  }
-  updateDraft(userId, draftId, updates) {
-    const draft = this.state.drafts.find((d) => d.id === draftId && d.userId === userId);
-    if (!draft) return null;
-    if (updates.title !== void 0) draft.title = updates.title;
-    if (updates.content !== void 0) draft.content = updates.content;
-    draft.version += 1;
-    draft.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
-    this.persist();
-    return draft;
-  }
-  addVaultDocument(doc) {
-    const created = {
-      ...doc,
-      id: crypto3.randomUUID(),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.vaultDocuments.unshift(created);
-    this.persist();
-    return created;
-  }
-  addContractReview(review) {
-    const created = {
-      ...review,
-      id: crypto3.randomUUID(),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.contractReviews.unshift(created);
-    this.persist();
-    return created;
-  }
-  updateRedlineClauseDecision(userId, reviewId, clauseId, decision) {
-    const review = this.state.contractReviews.find((c) => c.id === reviewId && c.userId === userId);
-    if (!review) return null;
-    const clause = review.clauses.find((cl) => cl.id === clauseId);
-    if (!clause) return null;
-    clause.decision = decision;
-    this.persist();
-    return review;
-  }
-  createCourtroomSession(session) {
-    const created = {
-      ...session,
-      id: crypto3.randomUUID(),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.courtroomSessions.unshift(created);
-    this.persist();
-    return created;
-  }
-  appendCourtroomTurns(userId, sessionId, newTurns, newVulnerabilities) {
-    const session = this.state.courtroomSessions.find((s) => s.id === sessionId && s.userId === userId);
-    if (!session) return null;
-    session.turns.push(...newTurns);
-    if (newVulnerabilities && newVulnerabilities.length > 0) {
-      session.vulnerabilities = Array.from(/* @__PURE__ */ new Set([...session.vulnerabilities, ...newVulnerabilities]));
-    }
-    this.persist();
-    return session;
-  }
-  addTrackedCase(item) {
-    const created = {
-      ...item,
-      id: crypto3.randomUUID(),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.trackedCases.push(created);
-    this.persist();
-    return created;
-  }
-  updateTrackedCaseStatus(userId, caseId, status) {
-    const item = this.state.trackedCases.find((tc) => tc.id === caseId && tc.userId === userId);
-    if (!item) return null;
-    item.status = status;
-    this.persist();
-    return item;
-  }
-  addDeadline(item) {
-    const created = {
-      ...item,
-      id: crypto3.randomUUID(),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.deadlines.push(created);
-    this.persist();
-    return created;
-  }
-  toggleDeadline(userId, deadlineId) {
-    const item = this.state.deadlines.find((d) => d.id === deadlineId && d.userId === userId);
-    if (!item) return null;
-    item.completed = !item.completed;
-    this.persist();
-    return item;
-  }
-  addMeetingBrief(brief) {
-    const created = {
-      ...brief,
-      id: crypto3.randomUUID(),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.meetingBriefs.unshift(created);
-    this.persist();
-    return created;
-  }
-  addWhatsAppMessage(msg) {
-    const created = {
-      ...msg,
-      id: crypto3.randomUUID(),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.whatsappMessages.push(created);
-    this.persist();
-    return created;
-  }
-  addAssistantMessage(msg) {
-    const created = {
-      ...msg,
-      id: crypto3.randomUUID(),
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.state.assistantMessages.push(created);
-    const userMsgs = this.state.assistantMessages.filter((m) => m.userId === msg.userId);
-    if (userMsgs.length > 120) {
-      const oldestId = userMsgs[0].id;
-      this.state.assistantMessages = this.state.assistantMessages.filter((m) => m.id !== oldestId);
-    }
-    this.persist();
-    return created;
-  }
-  clearAssistantMessages(userId) {
-    this.state.assistantMessages = this.state.assistantMessages.filter(
-      (m) => m.userId !== userId
-    );
-    this.persist();
-  }
-};
-var repository = new WorkspaceRepository();
-
-// src/server/geminiService.ts
-import { GoogleGenAI, Type } from "@google/genai";
+// src/server/agentOrchestrator.ts
+import crypto3 from "node:crypto";
 
 // src/lib/legal/supremeCourtCorpus.ts
 var SUPREME_COURT_CORPUS = [
@@ -1870,9 +494,6 @@ function formatPrecedentGroundingBlock(precedents) {
     )
   ].join("\n");
 }
-
-// src/server/nvidiaService.ts
-import crypto4 from "node:crypto";
 
 // src/lib/legal/statuteCrosswalk.ts
 var STATUTE_CROSSWALK = [
@@ -2435,8 +1056,11 @@ function scanDraftForLegacyCitations(text) {
   return matches.sort((a, b) => a.startIndex - b.startIndex);
 }
 
+// src/server/nvidiaService.ts
+import crypto2 from "node:crypto";
+
 // src/lib/legal/judiciaryTemplates.ts
-var JUDICIARY_FORM_TEMPLATES = [
+var BASE_JUDICIARY_FORM_TEMPLATES = [
   {
     id: "general_affidavit",
     name: "Affidavit-in-Support (Order XIX CPC / SC Rules)",
@@ -2581,6 +1205,65 @@ var JUDICIARY_FORM_TEMPLATES = [
     suggestedRelief: "Grant urgent interim security/injunction and appoint an independent sole arbitrator."
   }
 ];
+var TEMPLATE_METADATA_OVERRIDES = {
+  sec_63_bsa_certificate: {
+    applicableJurisdiction: "All Indian Courts & Tribunals (BSA 2023)",
+    requiredFields: ["courtName", "petitionerName", "respondentName", "deponentName", "factsSummary"],
+    supportingInstructions: "Attach Schedule Part A (Custodian declaration) and Part B (Hash value & expert/device specification) per Section 63(4) BSA 2023.",
+    validationRules: [
+      "Must specify device/server details and cryptographic hash algorithm (SHA-256).",
+      "Verify filing date is post-July 1, 2024 for BSA applicability (note IEA Sec. 65B for prior proceedings)."
+    ]
+  },
+  slp_article_136: {
+    applicableJurisdiction: "Supreme Court of India (Order XXI/XXII SC Rules 2013)",
+    requiredFields: ["courtName", "petitionerName", "respondentName", "factsSummary", "reliefSought"],
+    supportingInstructions: "Include Synopsis & List of Dates, Questions of Law, Form 28 Declaration, and certified copy of impugned High Court judgment.",
+    validationRules: [
+      "Verify 90-day Limitation Act Art. 133(c) window (60 days if HC refused certificate).",
+      "Cannot omit Declaration in Form 28 regarding prior SLP filings."
+    ]
+  },
+  anticipatory_bail_482_bnss: {
+    applicableJurisdiction: "High Courts & Sessions Courts in India (BNSS 2023)",
+    requiredFields: ["courtName", "petitionerName", "respondentName", "factsSummary"],
+    supportingInstructions: "Specify FIR No., Police Station, BNS sections invoked, prior Sec. 35 BNSS notice compliance, and undertaking to cooperate.",
+    validationRules: [
+      "Check state-specific amendments (e.g. U.P. Sec. 438 CrPC / BNSS applicability) before filing.",
+      "Ensure repealed IPC/CrPC sections are mapped to BNS/BNSS 2023."
+    ]
+  },
+  quashing_528_bnss: {
+    applicableJurisdiction: "High Courts of India (Inherent Jurisdiction u/s 528 BNSS)",
+    requiredFields: ["courtName", "petitionerName", "respondentName", "factsSummary", "reliefSought"],
+    supportingInstructions: "Map grounds explicitly to Ch. Bhajan Lal categories and include copy of impugned FIR/Chargesheet.",
+    validationRules: [
+      "Only High Courts possess inherent power u/s 528 BNSS; Sessions Courts cannot entertain quashing petitions."
+    ]
+  }
+};
+var JUDICIARY_FORM_TEMPLATES = BASE_JUDICIARY_FORM_TEMPLATES.map(
+  (tpl) => {
+    const override = TEMPLATE_METADATA_OVERRIDES[tpl.id];
+    return {
+      ...tpl,
+      applicableJurisdiction: override?.applicableJurisdiction ?? `${tpl.courtLevel} (India)`,
+      requiredFields: override?.requiredFields ?? [
+        "courtName",
+        "petitionerName",
+        "respondentName",
+        "factsSummary"
+      ],
+      supportingInstructions: override?.supportingInstructions ?? `Verify local High Court / Registry rules for ${tpl.courtLevel} and attach sworn Order XIX Rule 3 CPC verification.`,
+      version: "2026.2",
+      reviewDate: "2026-10-01",
+      validationRules: override?.validationRules ?? [
+        "Ensure cause title, party names, and verification clause are complete prior to filing.",
+        "Cross-check all repealed IPC/CrPC/IEA references against BNS/BNSS/BSA 2023."
+      ]
+    };
+  }
+);
 function getJudiciaryTemplate(id) {
   return JUDICIARY_FORM_TEMPLATES.find((t) => t.id === id) ?? JUDICIARY_FORM_TEMPLATES[0];
 }
@@ -2871,7 +1554,7 @@ function getNvidiaConfig() {
   };
 }
 function getCacheKey(tier, systemPrompt, userPrompt) {
-  return crypto4.createHash("sha256").update(`${tier}|${systemPrompt}|${userPrompt}`).digest("hex");
+  return crypto2.createHash("sha256").update(`${tier}|${systemPrompt}|${userPrompt}`).digest("hex");
 }
 function getCached(key) {
   const hit = RESPONSE_CACHE.get(key);
@@ -3143,7 +1826,7 @@ ${precedentBlock}`;
     const parsed = extractJsonFromText(res.text);
     const score = parsed.maintainabilityScore === "Strong" || parsed.maintainabilityScore === "Moderate" || parsed.maintainabilityScore === "High Risk" ? parsed.maintainabilityScore : "Strong";
     return {
-      id: crypto4.randomUUID(),
+      id: crypto2.randomUUID(),
       matterId: input.matterId,
       title: input.caseTitle,
       courtLevel: input.courtLevel,
@@ -3198,7 +1881,7 @@ ${precedentBlock}`;
       ])
     ).slice(0, 8);
     return {
-      id: crypto4.randomUUID(),
+      id: crypto2.randomUUID(),
       matterId: input.matterId,
       title: input.caseTitle,
       courtLevel: input.courtLevel,
@@ -3467,11 +2150,272 @@ ${topPrecedentsText}
   };
 }
 
+// src/server/agentOrchestrator.ts
+var MAX_AGENT_STEPS = 5;
+var WORKFLOW_PIPELINES = {
+  full_matter_brief: [
+    "Document Intelligence Agent",
+    "Research Agent",
+    "Case Analysis Agent",
+    "Compliance Agent",
+    "Quality Verification Agent"
+  ],
+  research_verification: ["Research Agent", "Case Analysis Agent", "Quality Verification Agent"],
+  draft_audit: ["Drafting Agent", "Compliance Agent", "Quality Verification Agent"],
+  contract_risk_audit: ["Contract Review Agent", "Compliance Agent", "Quality Verification Agent"],
+  compliance_deadline_check: ["Document Intelligence Agent", "Compliance Agent", "Quality Verification Agent"]
+};
+async function runSingleAgentStep(input) {
+  const startedAt = Date.now();
+  const precedents = retrieveRelevantPrecedents(
+    `${input.goal} ${input.matterFacts}`,
+    input.jurisdiction,
+    3
+  );
+  const legacyFlags = scanDraftForLegacyCitations(`${input.goal} ${input.matterFacts}`);
+  const precedentBlock = formatPrecedentGroundingBlock(precedents);
+  const agentRoleInstructions = {
+    "Research Agent": "Understand the legal question, identify controlling Indian/global authorities from the verified context, and distinguish binding ratio from obiter.",
+    "Drafting Agent": "Outline structured pleading/contract sections, identify missing factual particulars, and enforce Supreme Court / High Court formatting.",
+    "Case Analysis Agent": "Analyze core facts, frame legal issues, evaluate supporting and adverse authorities, and flag procedural maintainability hurdles.",
+    "Document Intelligence Agent": "Extract key parties, dates, monetary figures, statutory triggers, and potential factual contradictions from the matter record.",
+    "Contract Review Agent": "Flag high-risk clauses (indemnity, liability, termination, IP, arbitration seat), suggest balanced wording, and note commercial tradeoffs.",
+    "Compliance Agent": "Identify statutory obligations, Limitation Act deadlines, BNS/BNSS/BSA transitional compliance, and regulatory filing requirements.",
+    "Quality Verification Agent": "Audit all prior agent outputs for unsupported claims, unverified citations, statute currency, and hallucination risks. Mark uncertain assertions as [Verification Required]."
+  };
+  let outputSummary = "";
+  let tokensUsed = 0;
+  if (getNvidiaConfig().configured) {
+    try {
+      const res = await callNvidiaChat({
+        systemPrompt: buildSupremeCourtSystemPrompt(
+          input.jurisdiction,
+          `You are the "${input.agentName}" inside VidhiOS Multi-Agent Orchestrator.
+Role: ${agentRoleInstructions[input.agentName]}
+Keep output structured in 3-5 concise bullet points. Clearly separate verified facts/statutes from AI strategic suggestions. Never fabricate citations.`
+        ),
+        userPrompt: `WORKFLOW GOAL: ${input.goal}
+MATTER: ${input.matter ? `${input.matter.matterCode} \u2014 ${input.matter.title} (${input.matter.forum})` : "General Practice"}
+MATTER RECORD:
+${input.matterFacts.slice(0, 4e3)}
+
+PRIOR AGENT FINDINGS:
+${input.priorSummary.slice(0, 3e3) || "(Initial step)"}
+
+VERIFIED PRECEDENT CORPUS:
+${precedentBlock}
+
+LEGACY STATUTE FLAGS:
+${legacyFlags.length > 0 ? legacyFlags.map((f) => `${f.matchedText} -> ${f.replacementText}`).join("; ") : "None"}`,
+        tier: input.agentName === "Quality Verification Agent" ? "expert" : "fast",
+        maxTokens: 700
+      });
+      outputSummary = res.text;
+      tokensUsed = Math.ceil((outputSummary.length + input.goal.length) / 4);
+    } catch {
+      outputSummary = "";
+    }
+  }
+  if (!outputSummary) {
+    if (input.agentName === "Research Agent") {
+      outputSummary = precedents.length ? `Verified authorities matched (${precedents.length}): ${precedents.map((p) => `${p.caseName} (${p.citation})`).join("; ")}. [External live database verification recommended before filing]` : "No exact corpus match found; manual primary source search recommended.";
+    } else if (input.agentName === "Compliance Agent") {
+      outputSummary = legacyFlags.length > 0 ? `Detected ${legacyFlags.length} legacy citation(s) requiring BNS/BNSS/BSA 2023 upgrade: ${legacyFlags.map((f) => `${f.matchedText} \u2192 ${f.replacementText}`).join(", ")}. Verify Limitation Act timelines under Case Tracker.` : "No repealed IPC/CrPC/IEA citations detected in provided text. Verify Limitation Act Sec. 4 & Sec. 12 certified-copy exclusions.";
+    } else if (input.agentName === "Quality Verification Agent") {
+      outputSummary = `Verification audit complete: ${precedents.length} corpus precedents cross-checked; ${legacyFlags.length} legacy statutory references flagged. AI strategic recommendations require advocate review prior to court or client action.`;
+    } else {
+      outputSummary = `${input.agentName} reviewed matter "${input.matter?.title ?? "Workspace"}" for goal "${input.goal.slice(0, 80)}". Structured factual and statutory review prepared for advocate approval.`;
+    }
+  }
+  return {
+    id: crypto3.randomUUID(),
+    agentName: input.agentName,
+    stepTitle: `${input.agentName} Execution`,
+    status: input.agentName === "Quality Verification Agent" ? "awaiting_approval" : "completed",
+    inputSummary: input.goal.slice(0, 180),
+    outputSummary,
+    tokensUsed,
+    latencyMs: Date.now() - startedAt,
+    verificationNotes: input.agentName === "Quality Verification Agent" ? "Human-in-the-loop approval required before converting AI output into filings or client communications." : void 0,
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+async function executeMultiAgentWorkflow(input) {
+  const pipeline = (WORKFLOW_PIPELINES[input.workflowType] ?? WORKFLOW_PIPELINES.full_matter_brief).slice(
+    0,
+    MAX_AGENT_STEPS
+  );
+  const matterFacts = [
+    input.matter ? `Title: ${input.matter.title} | Client: ${input.matter.clientName} | Opposing: ${input.matter.opposingParty} | Forum: ${input.matter.forum}
+Facts: ${input.matter.summaryFacts}` : "No active matter selected.",
+    input.extraContext ? `Additional Context:
+${input.extraContext}` : ""
+  ].filter(Boolean).join("\n\n");
+  const steps = [];
+  let runningSummary = "";
+  let totalTokens = 0;
+  let totalLatencyMs = 0;
+  for (const agentName of pipeline) {
+    const stepLog = await runSingleAgentStep({
+      agentName,
+      goal: input.goal,
+      matter: input.matter,
+      jurisdiction: input.jurisdiction,
+      priorSummary: runningSummary,
+      matterFacts
+    });
+    steps.push(stepLog);
+    runningSummary += `
+[${agentName}]: ${stepLog.outputSummary}
+`;
+    totalTokens += stepLog.tokensUsed;
+    totalLatencyMs += stepLog.latencyMs;
+  }
+  const finalOutput = [
+    `### Multi-Agent Legal Workflow Summary (${input.workflowType.replace(/_/g, " ")})`,
+    `> **Notice:** Verified statutory mappings and corpus citations are separated from AI-generated strategic suggestions. Human advocate approval is required before acting on consequential recommendations.`,
+    "",
+    ...steps.map((s) => `#### ${s.agentName}
+${s.outputSummary}`)
+  ].join("\n\n");
+  return {
+    organizationId: input.organizationId,
+    userId: input.userId,
+    matterId: input.matter?.id ?? null,
+    workflowType: input.workflowType,
+    goal: input.goal,
+    status: "awaiting_approval",
+    requiresHumanApproval: true,
+    totalTokens,
+    totalLatencyMs,
+    steps,
+    finalOutput
+  };
+}
+
+// src/server/corporateService.ts
+function isCorporateProviderConfigured() {
+  const key = (process.env.MCA_API_KEY || process.env.SUREPASS_API_KEY || process.env.KARZA_API_KEY || "").trim();
+  return Boolean(key && !key.startsWith("MY_"));
+}
+async function lookupCorporateEntity(input) {
+  const cleanQuery = input.query.trim();
+  const isCin = /^[LU]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}$/i.test(cleanQuery);
+  const nowDate = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+  if (isCorporateProviderConfigured()) {
+    const apiUrl = (process.env.MCA_API_URL || "").trim();
+    const apiKey = (process.env.MCA_API_KEY || process.env.SUREPASS_API_KEY || process.env.KARZA_API_KEY || "").trim();
+    if (apiUrl && apiKey) {
+      const res = await fetch(`${apiUrl}?query=${encodeURIComponent(cleanQuery)}`, {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: "application/json"
+        },
+        signal: AbortSignal.timeout(1e4)
+      });
+      if (!res.ok) {
+        throw new Error(`Licensed Corporate API returned HTTP ${res.status}.`);
+      }
+      const data = await res.json();
+      return {
+        organizationId: input.organizationId,
+        userId: input.userId,
+        matterId: input.matterId,
+        cin: data.cin || (isCin ? cleanQuery.toUpperCase() : "UNVERIFIED"),
+        companyName: data.companyName || cleanQuery,
+        roc: data.roc || "Registrar of Companies",
+        status: data.status || "Active",
+        incorporationDate: data.incorporationDate || "",
+        authorizedCapital: data.authorizedCapital || "",
+        paidUpCapital: data.paidUpCapital || "",
+        registeredAddress: data.registeredAddress || "",
+        directors: data.directors || [],
+        charges: data.charges || [],
+        filings: data.filings || [],
+        aiDueDiligenceSummary: data.aiDueDiligenceSummary || "Corporate master record fetched from configured licensed provider. Conduct independent statutory inspection of original certified filings before transaction closing.",
+        redFlags: data.redFlags || [],
+        sourceProvider: "Configured Licensed Corporate API",
+        sourceDate: nowDate,
+        isMockData: false
+      };
+    }
+  }
+  const normalizedName = isCin ? `Sample Infrastructure Entity (${cleanQuery.toUpperCase()})` : cleanQuery.replace(/\s+/g, " ");
+  const mockCin = isCin ? cleanQuery.toUpperCase() : "U45200MH2019PTC321845";
+  return {
+    organizationId: input.organizationId,
+    userId: input.userId,
+    matterId: input.matterId,
+    cin: mockCin,
+    companyName: normalizedName,
+    roc: "RoC Mumbai (Sandbox Sample)",
+    status: "Active (Sandbox Demo Record)",
+    incorporationDate: "2019-03-14",
+    authorizedCapital: "\u20B95,00,00,000",
+    paidUpCapital: "\u20B93,25,00,000",
+    registeredAddress: "Suite 402, Nariman Bhavan, Nariman Point, Mumbai - 400021 (Sample Address)",
+    directors: [
+      {
+        din: "08123456",
+        name: "Vikramaditya Kulkarni (Sample)",
+        designation: "Managing Director",
+        appointmentDate: "2019-03-14"
+      },
+      {
+        din: "08123499",
+        name: "Ananya Deshmukh (Sample)",
+        designation: "Whole-time Director",
+        appointmentDate: "2021-07-01"
+      }
+    ],
+    charges: [
+      {
+        chargeId: "CHG-10094218",
+        holder: "HDFC Bank Limited (Sample)",
+        amount: "\u20B94,50,00,000",
+        status: "OPEN",
+        date: "2024-02-18"
+      }
+    ],
+    filings: [
+      {
+        form: "AOC-4",
+        date: "2025-10-28",
+        description: "Financial Statements for FY 2024-25",
+        status: "Filed (Sample)"
+      },
+      {
+        form: "MGT-7",
+        date: "2025-11-21",
+        description: "Annual Return under Sec. 92 Companies Act, 2013",
+        status: "Filed (Sample)"
+      },
+      {
+        form: "DIR-12",
+        date: "2024-08-12",
+        description: "Change in Director particulars",
+        status: "Approved (Sample)"
+      }
+    ],
+    aiDueDiligenceSummary: "[SANDBOX MOCK DATA] Preliminary corporate profile generated for workflow evaluation. Configure MCA_API_URL and MCA_API_KEY (or SUREPASS_API_KEY / KARZA_API_KEY) to retrieve live official MCA v3 master data, certified charges, and filings. Note: Open charges or delayed filings indicate items requiring verification, not proven misconduct.",
+    redFlags: [
+      "Open charge of \u20B94.50 Cr registered with HDFC Bank (requires NOC / satisfaction check prior to M&A closing).",
+      "Live MCA v3 verification pending: configure licensed MCA provider credentials for statutory sign-off."
+    ],
+    sourceProvider: "VidhiOS Sandbox Mock Provider (Licensed MCA API Not Configured)",
+    sourceDate: nowDate,
+    isMockData: true
+  };
+}
+
+// src/server/geminiService.ts
+import { GoogleGenAI, Type } from "@google/genai";
+
 // src/server/realtimeLegalSearch.ts
 function stripHtml(raw) {
   return raw.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, " ").trim();
 }
-async function fetchLiveKanoonResults(query, timeoutMs = 4e3) {
+async function fetchLiveKanoonResults(query, timeoutMs = 3500) {
   const authorities = [];
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -3495,9 +2439,11 @@ async function fetchLiveKanoonResults(query, timeoutMs = 4e3) {
         authorities.push({
           title: rawTitle,
           url: `https://indiankanoon.org${docPath}`,
-          court: "Live Judicial Authority",
+          court: "Search Candidate (Verification Pending)",
           sourceType: "live_kanoon",
-          snippet: `Live Kanoon Authority: ${rawTitle}`
+          sourceTier: 6,
+          verificationStatus: "verification_pending",
+          snippet: `Search snippet candidate: ${rawTitle}. Open official court source or full text to verify.`
         });
       }
     }
@@ -3507,9 +2453,57 @@ async function fetchLiveKanoonResults(query, timeoutMs = 4e3) {
   }
   return authorities;
 }
-async function fetchRealtimeLegalData(query, jurisdiction, matterContext = "") {
+function detectPrecedentConflicts(query, jurisdiction) {
+  const lower = query.toLowerCase();
+  const conflicts = [];
+  if (jurisdiction === "india_litigation" && (lower.includes("bail") || lower.includes("482") || lower.includes("438") || lower.includes("arrest"))) {
+    conflicts.push({
+      topic: "Anticipatory Bail Duration & Economic Offence Standards",
+      supportingAuthority: "Sushila Aggarwal v. State (NCT of Delhi), (2020) 5 SCC 1 (5-Judge Constitution Bench)",
+      adverseOrDistinguishedAuthority: "Y.S. Jagan Mohan Reddy / Nimmagadda Prasad (economic offence gravity exception)",
+      courtHierarchyNote: "5-Judge Constitution Bench in Sushila Aggarwal binds smaller Division Benches on pre-arrest bail duration.",
+      distinctionSummary: "Economic offences require stricter scrutiny of flight/tampering risk, but Satender Kumar Antil (2022) 10 SCC 51 clarifies they are not an absolute bar to bail where investigation is documentary."
+    });
+  }
+  if (jurisdiction === "india_litigation" && (lower.includes("420") || lower.includes("406") || lower.includes("318") || lower.includes("quash") || lower.includes("528"))) {
+    conflicts.push({
+      topic: "Simultaneous Invocation of Cheating (318 BNS) & Criminal Breach of Trust (316 BNS)",
+      supportingAuthority: "Delhi Race Club (1940) Ltd. v. State of U.P., 2024 INSC 626 (Division Bench)",
+      adverseOrDistinguishedAuthority: "Neeharika Infrastructure Pvt. Ltd. v. State of Maharashtra, (2021) 3 SCC 1 (3-Judge Bench)",
+      courtHierarchyNote: "3-Judge Bench in Neeharika cautions against premature quashing of nascent investigations; Delhi Race Club (2024) mandates quashing where civil breach is dressed as mutually exclusive offences.",
+      distinctionSummary: "Both decisions remain good law in their respective spheres: High Court must test whether FIR allegations disclose ingredients at face value (Bhajan Lal / Delhi Race Club) without conducting a mini-trial (Neeharika)."
+    });
+  }
+  if (lower.includes("arbitration") || lower.includes("unilateral") || lower.includes("34") || lower.includes("seat")) {
+    conflicts.push({
+      topic: "Unilateral Arbitrator Appointments & Public-Private Contracts",
+      supportingAuthority: "Central Organisation for Railway Electrification (CORE) v. ECI-SPIC-SMO-MCML, 2024 INSC 857 (5-Judge Constitution Bench)",
+      adverseOrDistinguishedAuthority: "Earlier curated-panel view in CORE (2020) 14 SCC 712 (3-Judge Bench)",
+      courtHierarchyNote: "2024 5-Judge Constitution Bench prospectively settled that unilateral panels violate Art. 14 equality.",
+      distinctionSummary: "Apply prospective ruling analysis depending on the date of arbitrator appointment; verify whether Section 12(5) waiver was executed post-dispute."
+    });
+  }
+  if (lower.includes("63") || lower.includes("65b") || lower.includes("electronic")) {
+    conflicts.push({
+      topic: "Mandatory Sec. 63 BSA / 65B IEA Certificate Requirement",
+      supportingAuthority: "Arjun Panditrao Khotkar v. Kailash Kushanrao Gorantyal, (2020) 7 SCC 1 (3-Judge Bench)",
+      adverseOrDistinguishedAuthority: "Shafhi Mohammad v. State of H.P., (2018) 2 SCC 801 (2-Judge Bench \u2014 Overruled)",
+      courtHierarchyNote: "3-Judge Bench in Arjun Panditrao Khotkar expressly overruled Shafhi Mohammad.",
+      distinctionSummary: "Certificate under Sec. 63(4) BSA (with Schedule Part A & B) is mandatory for secondary electronic evidence unless the original primary device is produced."
+    });
+  }
+  return conflicts;
+}
+async function fetchRealtimeLegalData(query, jurisdiction, matterContext = "", filters) {
   const startedAt = Date.now();
-  const combinedText = `${query} ${matterContext}`.trim();
+  const filterTokens = [
+    filters?.court,
+    filters?.judge,
+    filters?.statute,
+    filters?.caseName,
+    filters?.citation
+  ].filter(Boolean).join(" ");
+  const combinedText = `${query} ${filterTokens} ${matterContext}`.trim();
   const matchedStatutes = lookupStatuteMappings(combinedText);
   let statutoryGroundingText = "";
   if (matchedStatutes.length > 0) {
@@ -3518,37 +2512,77 @@ ${matchedStatutes.slice(0, 5).map(
       (s) => `- ${s.legacyCode} Sec. ${s.legacySection} -> ${s.newCode} Sec. ${s.newSection} (${s.title}). Note: ${s.keyChangeNote}`
     ).join("\n")}`;
   }
-  const curatedPrecedents = retrieveRelevantPrecedents(combinedText, jurisdiction, 4);
+  let curatedPrecedents = retrieveRelevantPrecedents(combinedText, jurisdiction, 5);
+  if (filters?.court) {
+    const courtLower = filters.court.toLowerCase();
+    const filtered = SUPREME_COURT_CORPUS.filter(
+      (p) => p.court.toLowerCase().includes(courtLower)
+    );
+    if (filtered.length > 0) {
+      curatedPrecedents = filtered.slice(0, 4);
+    }
+  }
   const precedentGroundingText = formatPrecedentGroundingBlock(curatedPrecedents);
   let liveKanoonAuthorities = [];
   if (jurisdiction === "india_litigation" || combinedText.toLowerCase().includes("india") || combinedText.toLowerCase().includes("act")) {
-    const cleanedSearchTerms = query.replace(/[^\w\s]/g, " ").split(/\s+/).filter((w) => w.length > 3).slice(0, 6).join(" ");
+    const cleanedSearchTerms = `${query} ${filters?.caseName || ""} ${filters?.citation || ""} ${filters?.statute || ""}`.replace(/[^\w\s]/g, " ").split(/\s+/).filter((w) => w.length > 3).slice(0, 6).join(" ");
     liveKanoonAuthorities = await fetchLiveKanoonResults(cleanedSearchTerms || query);
   }
   const liveAuthorities = [];
-  for (const k of liveKanoonAuthorities) {
-    liveAuthorities.push(k);
-  }
   for (const p of curatedPrecedents) {
+    const isSC = p.court.toLowerCase().includes("supreme court");
     liveAuthorities.push({
       title: `${p.caseName}, ${p.citation}`,
+      citation: p.citation,
       court: `${p.court} (${p.bench}, ${p.year})`,
+      decisionDate: String(p.year),
+      legalIssue: p.statutes.join(", "),
+      legalPrinciple: p.ratio,
+      outcome: p.practicalApplication,
       url: `https://indiankanoon.org/search/?formInput=${encodeURIComponent(p.caseName)}`,
       sourceType: "supreme_court_corpus",
+      sourceTier: isSC ? 1 : 2,
+      verificationStatus: "verified_primary",
       snippet: p.ratio
     });
+  }
+  for (const s of matchedStatutes.slice(0, 2)) {
+    liveAuthorities.push({
+      title: `${s.newCode} Section ${s.newSection} \u2014 ${s.title} (replacing ${s.legacyCode} ${s.legacySection})`,
+      court: "India Code / Official Legislation (2023 Codes)",
+      decisionDate: "2024-07-01",
+      legalPrinciple: s.keyChangeNote,
+      url: "https://www.indiacode.nic.in/",
+      sourceType: "statute_crosswalk",
+      sourceTier: 3,
+      verificationStatus: "verified_legislation",
+      snippet: s.keyChangeNote
+    });
+  }
+  for (const k of liveKanoonAuthorities) {
+    liveAuthorities.push(k);
   }
   const citations = liveAuthorities.map((a) => ({
     title: a.title,
     url: a.url,
-    courtOrSource: a.court || "Supreme Court / High Court Record",
-    status: a.sourceType === "live_kanoon" ? "verified_web" : "statute"
+    courtOrSource: a.court || "Official Record",
+    decisionDate: a.decisionDate,
+    citation: a.citation,
+    relevantParagraphs: a.relevantParagraphs,
+    legalIssue: a.legalIssue,
+    legalPrinciple: a.legalPrinciple,
+    outcome: a.outcome,
+    sourceTier: a.sourceTier,
+    verificationStatus: a.verificationStatus,
+    status: a.verificationStatus === "verified_primary" || a.verificationStatus === "verified_legislation" ? "statute" : "caution"
   }));
+  const conflicts = detectPrecedentConflicts(combinedText, jurisdiction);
   return {
     query,
     jurisdiction,
     liveAuthorities,
     citations,
+    conflicts,
     statutoryGroundingText,
     precedentGroundingText,
     fetchLatencyMs: Date.now() - startedAt
@@ -3604,7 +2638,8 @@ async function runGroundedLegalResearch(input) {
   const realtime = await fetchRealtimeLegalData(
     input.query,
     input.jurisdiction,
-    input.matterContext
+    input.matterContext,
+    input.filters
   );
   if (getNvidiaConfig().configured) {
     try {
@@ -3616,7 +2651,7 @@ async function runGroundedLegalResearch(input) {
 ### Controlling Precedents
 ### Application to Active Matter
 ### Strategic Recommendation & Counter-Arguments
-Keep bullets tight and actionable, cite exact verified case names and section numbers inline, and never include preambles, horizontal rules (---), or code fences.`
+Keep bullets tight and actionable, cite exact verified case names and section numbers inline, distinguish primary verified authorities from unverified search leads, and never include preambles, horizontal rules (---), or code fences.`
       );
       const contextParts = [
         `ACTIVE MATTER CONTEXT:
@@ -3640,15 +2675,43 @@ ${input.query}`
       return {
         answerMarkdown: formatAiMarkdownResponse(res.text),
         citations: realtime.citations,
+        conflicts: realtime.conflicts,
         citationIntegrity: {
-          verifiedSourceCount: realtime.citations.length,
-          jurisdictionChecked: input.jurisdiction === "india_litigation" ? `NVIDIA NIM (${res.model}) \xB7 Live Kanoon & BNS/BNSS/BSA` : input.jurisdiction === "corporate_ma" ? `NVIDIA NIM (${res.model}) \xB7 Corporate, M&A & Commercial Statutes` : `NVIDIA NIM (${res.model}) \xB7 International Arbitration & Multi-Jurisdiction`,
-          bnsComplianceNote: input.jurisdiction === "india_litigation" ? `Generated in ${res.latencyMs}ms with live statutory verification.` : `Generated in ${res.latencyMs}ms with commercial currency check.`,
+          verifiedSourceCount: realtime.citations.filter(
+            (c) => c.verificationStatus !== "verification_pending"
+          ).length,
+          jurisdictionChecked: input.jurisdiction === "india_litigation" ? `NVIDIA NIM (${res.model}) \xB7 Source Hierarchy & BNS/BNSS/BSA` : input.jurisdiction === "corporate_ma" ? `NVIDIA NIM (${res.model}) \xB7 Corporate, M&A & Commercial Statutes` : `NVIDIA NIM (${res.model}) \xB7 International Arbitration & Multi-Jurisdiction`,
+          bnsComplianceNote: input.jurisdiction === "india_litigation" ? `Generated in ${res.latencyMs}ms with primary-source hierarchy check.` : `Generated in ${res.latencyMs}ms with commercial currency check.`,
           confidenceLabel: "Grounded via Web & Statute"
         }
       };
     } catch {
     }
+  }
+  if (!isGeminiConfigured()) {
+    const fallbackMd = [
+      "### Executive Conclusion",
+      `Research query analysed against VidhiOS verified Supreme Court / High Court corpus and statutory crosswalk (${realtime.citations.length} source(s) matched). Live AI synthesis requires NVIDIA_API_KEY or GEMINI_API_KEY.`,
+      "",
+      "### Statutory Framework & BNS/BNSS/BSA Alignment",
+      realtime.statutoryGroundingText || "No specific legacy IPC/CrPC/IEA section detected in query.",
+      "",
+      "### Controlling Precedents",
+      realtime.precedentGroundingText || "No exact corpus match; inspect primary court databases."
+    ].join("\n");
+    return {
+      answerMarkdown: formatAiMarkdownResponse(fallbackMd),
+      citations: realtime.citations,
+      conflicts: realtime.conflicts,
+      citationIntegrity: {
+        verifiedSourceCount: realtime.citations.filter(
+          (c) => c.verificationStatus !== "verification_pending"
+        ).length,
+        jurisdictionChecked: "VidhiOS Deterministic Corpus & Statute Crosswalk",
+        bnsComplianceNote: "Verified against local statutory crosswalk & SC/HC corpus.",
+        confidenceLabel: "Statutory Analysis Only"
+      }
+    };
   }
   const ai = getAiClient();
   const prompt = `Active Matter Context:
@@ -3670,7 +2733,7 @@ Provide a rigorous, structured legal research memorandum using ONLY clean Markdo
   });
   const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
   const seenUrls = /* @__PURE__ */ new Set();
-  const citations = [];
+  const citations = [...realtime.citations];
   for (const chunk of chunks) {
     const web = chunk.web;
     const safeUrl = sanitizeSafeUrl(web?.uri);
@@ -3685,6 +2748,8 @@ Provide a rigorous, structured legal research memorandum using ONLY clean Markdo
         title: web?.title?.trim() || host,
         url: safeUrl,
         courtOrSource: host,
+        sourceTier: 5,
+        verificationStatus: "verification_pending",
         status: "verified_web"
       });
     }
@@ -3692,8 +2757,9 @@ Provide a rigorous, structured legal research memorandum using ONLY clean Markdo
   return {
     answerMarkdown: formatAiMarkdownResponse(response.text?.trim() || "No research output returned."),
     citations,
+    conflicts: realtime.conflicts,
     citationIntegrity: {
-      verifiedSourceCount: citations.length,
+      verifiedSourceCount: citations.filter((c) => c.verificationStatus !== "verification_pending").length,
       jurisdictionChecked: input.jurisdiction === "india_litigation" ? "Indian Courts & BNS/BNSS/BSA Statutes" : input.jurisdiction === "corporate_ma" ? "Corporate, M&A & Commercial Statutes" : "Multi-Jurisdiction & International Arbitration",
       bnsComplianceNote: input.jurisdiction === "india_litigation" ? "Reviewed for BNS 2023 / BNSS 2023 / BSA 2023 alignment." : "Reviewed for commercial enforceability & statutory currency.",
       confidenceLabel: citations.length > 0 ? "Grounded via Web & Statute" : "Statutory Analysis Only"
@@ -3705,19 +2771,21 @@ async function streamGroundedLegalResearch(input, onEvent) {
     type: "stage",
     data: {
       stage: "fetching_realtime",
-      label: "Fetching real-time legal data, statutory crosswalk & Kanoon authorities..."
+      label: "Planning query, checking statutory crosswalk & primary court hierarchy..."
     }
   });
   const realtime = await fetchRealtimeLegalData(
     input.query,
     input.jurisdiction,
-    input.matterContext
+    input.matterContext,
+    input.filters
   );
   onEvent({
     type: "authorities",
     data: {
       authorities: realtime.liveAuthorities,
-      citations: realtime.citations
+      citations: realtime.citations,
+      conflicts: realtime.conflicts
     }
   });
   const tier = input.tier ?? "fast";
@@ -3768,9 +2836,12 @@ ${input.query}`
       return {
         answerMarkdown: cleanedText,
         citations: realtime.citations,
+        conflicts: realtime.conflicts,
         citationIntegrity: {
-          verifiedSourceCount: realtime.citations.length,
-          jurisdictionChecked: input.jurisdiction === "india_litigation" ? `NVIDIA NIM (${res.model}) \xB7 Live Kanoon & BNS/BNSS/BSA` : input.jurisdiction === "corporate_ma" ? `NVIDIA NIM (${res.model}) \xB7 Corporate & Commercial Enforceability` : `NVIDIA NIM (${res.model}) \xB7 International Arbitration & New York Convention`,
+          verifiedSourceCount: realtime.citations.filter(
+            (c) => c.verificationStatus !== "verification_pending"
+          ).length,
+          jurisdictionChecked: input.jurisdiction === "india_litigation" ? `NVIDIA NIM (${res.model}) \xB7 Source Hierarchy & BNS/BNSS/BSA` : input.jurisdiction === "corporate_ma" ? `NVIDIA NIM (${res.model}) \xB7 Corporate & Commercial Enforceability` : `NVIDIA NIM (${res.model}) \xB7 International Arbitration & New York Convention`,
           bnsComplianceNote: input.jurisdiction === "india_litigation" ? `Generated in ${res.latencyMs}ms with live statutory crosswalk verification.` : `Generated in ${res.latencyMs}ms with commercial statutory currency check.`,
           confidenceLabel: "Grounded via Web & Statute"
         }
@@ -4074,13 +3145,53 @@ ${input.contractText.slice(0, 35e3)}`,
     requisitions: parsed.requisitions ?? []
   };
 }
+function extractDeterministicEntities(text, fileName) {
+  const dateMatches = Array.from(
+    new Set(
+      text.match(
+        /\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})\b/gi
+      ) ?? []
+    )
+  ).slice(0, 12);
+  const amountMatches = Array.from(
+    new Set(
+      text.match(/(?:₹|Rs\.?|INR|USD|\$)\s?[\d,.]+(?:\s?(?:Cr|Crore|Lakhs?|Million|M|Bn))?/gi) ?? []
+    )
+  ).slice(0, 10);
+  const statuteMatches = Array.from(
+    new Set(
+      text.match(
+        /\b(?:Section|Sec\.?|Article|Art\.?)\s+\d+[A-Za-z()]*\s*(?:of\s+)?(?:BNS|BNSS|BSA|IPC|CrPC|IEA|CPC|Constitution|Arbitration\s+Act|Contract\s+Act|NI\s+Act)?/gi
+      ) ?? []
+    )
+  ).slice(0, 12);
+  const detectedLanguage = /[\u0900-\u097F]/.test(text) ? "Hindi / Devanagari" : "English";
+  const chronology = dateMatches.slice(0, 6).map((d) => ({
+    date: d,
+    event: `Referenced event on ${d} in ${fileName}`,
+    sourceDoc: fileName,
+    pageOrPara: "Extracted text",
+    significance: "Verify exact factual context against original document."
+  }));
+  return {
+    entities: {
+      parties: [],
+      dates: dateMatches,
+      amounts: amountMatches,
+      statutes: statuteMatches,
+      detectedLanguage,
+      summary: text.slice(0, 280).trim() + (text.length > 280 ? "..." : "")
+    },
+    chronology
+  };
+}
 async function processVaultDocument(input) {
   const translateDirective = input.targetLanguage && input.targetLanguage !== "None" ? `Also translate the extracted legal text accurately into ${input.targetLanguage}, strictly preserving legal terms of art.` : "Leave translatedText as an empty string.";
   if (!input.base64Data && input.textInput && getNvidiaConfig().configured) {
     try {
       const systemPrompt = buildSupremeCourtSystemPrompt(
         input.jurisdiction,
-        'You are a Forensic Litigation Document Analyst. Return ONLY valid JSON with keys: "extractedText" (string), "translatedText" (string), "chronology" (array of {date, event, sourceDoc, significance}), and "contradictions" (array of {topic, statementA, statementB, severity ("high"|"medium"|"low"), recommendation}).'
+        'You are a Forensic Litigation Document Analyst. Return ONLY valid JSON with keys: "extractedText" (string), "translatedText" (string), "entities" ({parties: string[], dates: string[], amounts: string[], statutes: string[], detectedLanguage: string, summary: string}), "chronology" (array of {date, event, sourceDoc, pageOrPara, significance}), and "contradictions" (array of {topic, statementA, statementB, severity ("high"|"medium"|"low"), recommendation}).'
       );
       const res = await callNvidiaChat({
         systemPrompt,
@@ -4097,10 +3208,19 @@ ${translateDirective}`,
         maxTokens: 2800
       });
       const parsed2 = extractJsonFromText(res.text);
+      const det2 = extractDeterministicEntities(parsed2.extractedText || input.textInput, input.fileName);
       return {
         extractedText: parsed2.extractedText || input.textInput,
         translatedText: parsed2.translatedText || "",
-        chronology: parsed2.chronology ?? [],
+        entities: {
+          parties: parsed2.entities?.parties ?? det2.entities.parties,
+          dates: parsed2.entities?.dates ?? det2.entities.dates,
+          amounts: parsed2.entities?.amounts ?? det2.entities.amounts,
+          statutes: parsed2.entities?.statutes ?? det2.entities.statutes,
+          detectedLanguage: parsed2.entities?.detectedLanguage ?? det2.entities.detectedLanguage,
+          summary: parsed2.entities?.summary ?? det2.entities.summary
+        },
+        chronology: parsed2.chronology ?? det2.chronology,
         contradictions: (parsed2.contradictions ?? []).map((c) => ({
           ...c,
           severity: c.severity === "high" || c.severity === "medium" || c.severity === "low" ? c.severity : "medium"
@@ -4108,6 +3228,16 @@ ${translateDirective}`,
       };
     } catch {
     }
+  }
+  if (!isGeminiConfigured() && input.textInput) {
+    const det2 = extractDeterministicEntities(input.textInput, input.fileName);
+    return {
+      extractedText: input.textInput,
+      translatedText: "",
+      entities: det2.entities,
+      chronology: det2.chronology,
+      contradictions: []
+    };
   }
   const ai = getAiClient();
   const parts = [];
@@ -4129,7 +3259,7 @@ ${input.existingDocsContext.slice(0, 12e3)}
 
 Tasks:
 1. Perform faithful OCR/text extraction preserving legal formatting.
-2. Extract a chronological List of Dates & Events (YYYY-MM-DD where possible) from this document.
+2. Extract a chronological List of Dates & Events (YYYY-MM-DD where possible) with page/paragraph reference.
 3. Detect any factual, date, monetary, or procedural contradictions between this document and the Existing Matter Documents Context (or internal inconsistencies).
 4. ${translateDirective}`
   });
@@ -4177,10 +3307,13 @@ Tasks:
     }
   });
   const parsed = JSON.parse((response.text ?? "{}").trim());
+  const extracted = parsed.extractedText || input.textInput || "";
+  const det = extractDeterministicEntities(extracted, input.fileName);
   return {
-    extractedText: parsed.extractedText || input.textInput || "",
+    extractedText: extracted,
     translatedText: parsed.translatedText || "",
-    chronology: parsed.chronology ?? [],
+    entities: det.entities,
+    chronology: parsed.chronology ?? det.chronology,
     contradictions: (parsed.contradictions ?? []).map((c) => ({
       ...c,
       severity: c.severity === "high" || c.severity === "medium" || c.severity === "low" ? c.severity : "medium"
@@ -4309,6 +3442,3830 @@ ${input.prompt}`,
     }
   });
   return formatAiMarkdownResponse(response.text?.trim() || "Unable to process query right now.");
+}
+
+// src/server/neonDatabase.ts
+import { Pool } from "pg";
+var activePool = null;
+var resolvedHostIp = null;
+var lastDbError = null;
+var lastDbSyncAt = null;
+function getNeonHealthSnapshot() {
+  return {
+    lastDbError,
+    lastDbSyncAt
+  };
+}
+function getNeonConnectionString() {
+  const url = (process.env.DATABASE_URL || process.env.NEON_DATABASE_URL || "").trim();
+  if (!url || url === "MY_DATABASE_URL" || url === "MY_NEON_DATABASE_URL" || url === "postgresql://...") {
+    return "";
+  }
+  return url;
+}
+function isNeonConfigured() {
+  return Boolean(getNeonConnectionString());
+}
+async function resolveHostViaDoH(hostname) {
+  if (resolvedHostIp) return resolvedHostIp;
+  if (process.env.NETLIFY || process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.NODE_ENV === "production") {
+    return null;
+  }
+  try {
+    const res = await fetch(
+      `https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=A`,
+      {
+        headers: { Accept: "application/dns-json" },
+        signal: AbortSignal.timeout(2e3)
+      }
+    );
+    if (!res.ok) return null;
+    const json = await res.json();
+    const ip = json.Answer?.find((a) => a.type === 1)?.data;
+    if (ip) {
+      resolvedHostIp = ip;
+      return ip;
+    }
+  } catch {
+  }
+  return null;
+}
+async function getNeonPool() {
+  const connectionString = getNeonConnectionString();
+  if (!connectionString) return null;
+  if (activePool) return activePool;
+  try {
+    const parsed = new URL(connectionString);
+    const hostname = parsed.hostname;
+    const ip = await resolveHostViaDoH(hostname);
+    activePool = new Pool({
+      host: ip || hostname,
+      port: Number(parsed.port) || 5432,
+      user: decodeURIComponent(parsed.username),
+      password: decodeURIComponent(parsed.password),
+      database: parsed.pathname.replace(/^\//, "") || "neondb",
+      ssl: {
+        servername: hostname,
+        rejectUnauthorized: process.env.PG_ALLOW_SELF_SIGNED === "true" ? false : true
+      },
+      max: 12,
+      idleTimeoutMillis: 3e4,
+      connectionTimeoutMillis: 8e3
+    });
+    activePool.on("error", (err) => {
+      lastDbError = err.message;
+      console.error("[Neon Pool Error]:", err.message);
+    });
+    return activePool;
+  } catch (err) {
+    lastDbError = err instanceof Error ? err.message : "Neon pool init failed";
+    console.error("[Neon Pool Init Failed]:", err);
+    return null;
+  }
+}
+async function testNeonConnection() {
+  const startedAt = Date.now();
+  const pool = await getNeonPool();
+  if (!pool) {
+    return { ok: false, error: "DATABASE_URL or NEON_DATABASE_URL is not configured." };
+  }
+  let client = null;
+  try {
+    client = await pool.connect();
+    const res = await client.query(
+      "SELECT version() as version, current_database() as db, now() as current_time;"
+    );
+    lastDbError = null;
+    return {
+      ok: true,
+      version: res.rows[0]?.version || "PostgreSQL (Neon Serverless)",
+      database: res.rows[0]?.db || "neondb",
+      latencyMs: Date.now() - startedAt,
+      lastDbSyncAt
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Failed to connect to Neon database.";
+    lastDbError = msg;
+    return {
+      ok: false,
+      error: msg,
+      latencyMs: Date.now() - startedAt,
+      lastDbSyncAt
+    };
+  } finally {
+    client?.release();
+  }
+}
+var schemaInitialized = false;
+async function initNeonSchema(force = false) {
+  if (schemaInitialized && !force) return;
+  const pool = await getNeonPool();
+  if (!pool) return;
+  let client = null;
+  try {
+    client = await pool.connect();
+    await client.query('CREATE EXTENSION IF NOT EXISTS "pgcrypto";');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS organizations (
+        id text PRIMARY KEY,
+        name text NOT NULL,
+        slug text NOT NULL UNIQUE,
+        tier text NOT NULL DEFAULT 'PRO',
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS organization_members (
+        id text PRIMARY KEY,
+        organization_id text NOT NULL,
+        user_id text NOT NULL,
+        role text NOT NULL DEFAULT 'advocate',
+        permissions jsonb NOT NULL DEFAULT '[]'::jsonb,
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS users (
+        id text PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        full_name text NOT NULL,
+        role text NOT NULL DEFAULT 'Advocate',
+        organization text DEFAULT '',
+        organization_id text DEFAULT '',
+        org_role text NOT NULL DEFAULT 'advocate',
+        default_jurisdiction text NOT NULL DEFAULT 'india_litigation',
+        is_admin boolean DEFAULT false,
+        password_hash text NOT NULL,
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS clients (
+        id text PRIMARY KEY,
+        organization_id text NOT NULL,
+        user_id text NOT NULL,
+        name text NOT NULL,
+        email text DEFAULT '',
+        phone text DEFAULT '',
+        company text DEFAULT '',
+        address text DEFAULT '',
+        pan_or_cin text DEFAULT '',
+        notes text DEFAULT '',
+        portal_access_enabled boolean NOT NULL DEFAULT false,
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS matters (
+        id text PRIMARY KEY,
+        user_id text NOT NULL,
+        organization_id text DEFAULT '',
+        client_id text DEFAULT '',
+        assigned_user_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+        title text NOT NULL,
+        matter_code text NOT NULL,
+        client_name text NOT NULL,
+        opposing_party text DEFAULT '',
+        jurisdiction text NOT NULL DEFAULT 'india_litigation',
+        forum text NOT NULL,
+        case_type text DEFAULT '',
+        cnr_number text DEFAULT '',
+        filing_date text DEFAULT '',
+        assigned_advocate text DEFAULT '',
+        status text NOT NULL DEFAULT 'active',
+        summary_facts text DEFAULT '',
+        created_at text NOT NULL,
+        updated_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS tasks (
+        id text PRIMARY KEY,
+        organization_id text NOT NULL,
+        matter_id text NOT NULL,
+        user_id text NOT NULL,
+        assigned_to_user_id text DEFAULT '',
+        assigned_to_name text DEFAULT '',
+        title text NOT NULL,
+        priority text NOT NULL DEFAULT 'medium',
+        status text NOT NULL DEFAULT 'todo',
+        due_date text NOT NULL,
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS hearings (
+        id text PRIMARY KEY,
+        organization_id text NOT NULL,
+        matter_id text NOT NULL,
+        tracked_case_id text DEFAULT '',
+        user_id text NOT NULL,
+        hearing_date text NOT NULL,
+        court text NOT NULL,
+        courtroom text DEFAULT '',
+        bench text DEFAULT '',
+        cause_list_item text DEFAULT '',
+        outcome text NOT NULL DEFAULT 'scheduled',
+        next_hearing_date text DEFAULT '',
+        adjournment_reason text DEFAULT '',
+        notes text DEFAULT '',
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS research_memos (
+        id text PRIMARY KEY,
+        matter_id text NOT NULL,
+        user_id text NOT NULL,
+        organization_id text DEFAULT '',
+        query text NOT NULL,
+        jurisdiction text NOT NULL,
+        filters jsonb NOT NULL DEFAULT '{}'::jsonb,
+        answer_markdown text NOT NULL,
+        citations jsonb NOT NULL DEFAULT '[]'::jsonb,
+        citation_integrity jsonb NOT NULL DEFAULT '{}'::jsonb,
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS drafts (
+        id text PRIMARY KEY,
+        matter_id text NOT NULL,
+        user_id text NOT NULL,
+        organization_id text DEFAULT '',
+        title text NOT NULL,
+        doc_type text NOT NULL,
+        content text NOT NULL,
+        status text NOT NULL DEFAULT 'draft',
+        version integer NOT NULL DEFAULT 1,
+        versions jsonb NOT NULL DEFAULT '[]'::jsonb,
+        updated_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS vault_documents (
+        id text PRIMARY KEY,
+        matter_id text NOT NULL,
+        user_id text NOT NULL,
+        organization_id text DEFAULT '',
+        file_name text NOT NULL,
+        mime_type text NOT NULL,
+        file_size_bytes integer DEFAULT 0,
+        doc_category text NOT NULL DEFAULT 'Annexure',
+        processing_status text NOT NULL DEFAULT 'completed',
+        processing_error text DEFAULT '',
+        extracted_text text DEFAULT '',
+        translated_text text DEFAULT '',
+        target_language text DEFAULT '',
+        entities jsonb NOT NULL DEFAULT '{}'::jsonb,
+        chronology jsonb NOT NULL DEFAULT '[]'::jsonb,
+        contradictions jsonb NOT NULL DEFAULT '[]'::jsonb,
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS contract_reviews (
+        id text PRIMARY KEY,
+        matter_id text NOT NULL,
+        user_id text NOT NULL,
+        organization_id text DEFAULT '',
+        title text NOT NULL,
+        playbook text NOT NULL,
+        source_text text NOT NULL,
+        summary text DEFAULT '',
+        clauses jsonb NOT NULL DEFAULT '[]'::jsonb,
+        requisitions jsonb NOT NULL DEFAULT '[]'::jsonb,
+        obligations jsonb NOT NULL DEFAULT '[]'::jsonb,
+        renewal_date text DEFAULT '',
+        termination_notice_date text DEFAULT '',
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS courtroom_sessions (
+        id text PRIMARY KEY,
+        matter_id text NOT NULL,
+        user_id text NOT NULL,
+        mode text NOT NULL,
+        forum_context text NOT NULL,
+        brief_excerpt text NOT NULL,
+        turns jsonb NOT NULL DEFAULT '[]'::jsonb,
+        vulnerabilities jsonb NOT NULL DEFAULT '[]'::jsonb,
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS tracked_cases (
+        id text PRIMARY KEY,
+        matter_id text NOT NULL,
+        user_id text NOT NULL,
+        case_number text NOT NULL,
+        court text NOT NULL,
+        courtroom text DEFAULT '',
+        bench text DEFAULT '',
+        cause_list_item text DEFAULT '',
+        next_hearing_date text NOT NULL,
+        stage text NOT NULL,
+        notes text DEFAULT '',
+        cnr_number text DEFAULT '',
+        status text NOT NULL DEFAULT 'listed',
+        created_at text NOT NULL,
+        updated_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS deadlines (
+        id text PRIMARY KEY,
+        matter_id text NOT NULL,
+        user_id text NOT NULL,
+        title text NOT NULL,
+        statute_article text DEFAULT '',
+        trigger_date text NOT NULL,
+        due_date text NOT NULL,
+        grace_date text,
+        completed boolean NOT NULL DEFAULT false,
+        notes text DEFAULT '',
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS meeting_briefs (
+        id text PRIMARY KEY,
+        matter_id text NOT NULL,
+        user_id text NOT NULL,
+        title text NOT NULL,
+        duration_label text NOT NULL DEFAULT '05:00',
+        transcript text NOT NULL,
+        summary text NOT NULL,
+        key_facts jsonb NOT NULL DEFAULT '[]'::jsonb,
+        action_items jsonb NOT NULL DEFAULT '[]'::jsonb,
+        statutory_issues jsonb NOT NULL DEFAULT '[]'::jsonb,
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS whatsapp_messages (
+        id text PRIMARY KEY,
+        matter_id text,
+        user_id text NOT NULL,
+        sender text NOT NULL,
+        body text NOT NULL,
+        command_tag text DEFAULT '',
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS assistant_messages (
+        id text PRIMARY KEY,
+        user_id text NOT NULL,
+        matter_id text,
+        role text NOT NULL,
+        content text NOT NULL,
+        language_used text NOT NULL DEFAULT 'en',
+        verification_mode text NOT NULL DEFAULT 'deterministic_verified',
+        confidence_note text DEFAULT '',
+        sources jsonb NOT NULL DEFAULT '[]'::jsonb,
+        completed_actions jsonb NOT NULL DEFAULT '[]'::jsonb,
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS notifications (
+        id text PRIMARY KEY,
+        organization_id text NOT NULL,
+        user_id text NOT NULL,
+        title text NOT NULL,
+        message text NOT NULL,
+        kind text NOT NULL DEFAULT 'system',
+        read boolean NOT NULL DEFAULT false,
+        link_section text DEFAULT 'overview',
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS activity_logs (
+        id text PRIMARY KEY,
+        organization_id text NOT NULL,
+        user_id text NOT NULL,
+        actor_name text NOT NULL,
+        matter_id text DEFAULT '',
+        action text NOT NULL,
+        entity_type text NOT NULL,
+        entity_id text DEFAULT '',
+        summary text NOT NULL,
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS audit_events (
+        id text PRIMARY KEY,
+        organization_id text NOT NULL,
+        user_id text NOT NULL,
+        actor_email text NOT NULL,
+        event_type text NOT NULL,
+        resource_type text NOT NULL,
+        resource_id text DEFAULT '',
+        ip_address text DEFAULT '',
+        status text NOT NULL DEFAULT 'success',
+        details text DEFAULT '',
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        id text PRIMARY KEY,
+        organization_id text NOT NULL UNIQUE,
+        tier text NOT NULL DEFAULT 'PRO',
+        status text NOT NULL DEFAULT 'active',
+        ai_queries_limit integer NOT NULL DEFAULT 500,
+        ai_queries_used integer NOT NULL DEFAULT 0,
+        ai_tokens_used integer NOT NULL DEFAULT 0,
+        storage_limit_mb integer NOT NULL DEFAULT 2048,
+        storage_used_mb numeric NOT NULL DEFAULT 0,
+        max_matters integer NOT NULL DEFAULT 100,
+        max_seats integer NOT NULL DEFAULT 10,
+        expires_at text NOT NULL,
+        updated_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS workflow_runs (
+        id text PRIMARY KEY,
+        organization_id text NOT NULL,
+        user_id text NOT NULL,
+        matter_id text,
+        workflow_type text NOT NULL,
+        goal text NOT NULL,
+        status text NOT NULL,
+        requires_human_approval boolean NOT NULL DEFAULT true,
+        approved_by_user_id text DEFAULT '',
+        total_tokens integer NOT NULL DEFAULT 0,
+        total_latency_ms integer NOT NULL DEFAULT 0,
+        steps jsonb NOT NULL DEFAULT '[]'::jsonb,
+        final_output text DEFAULT '',
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS corporate_profiles (
+        id text PRIMARY KEY,
+        organization_id text NOT NULL,
+        user_id text NOT NULL,
+        matter_id text DEFAULT '',
+        cin text NOT NULL,
+        company_name text NOT NULL,
+        roc text DEFAULT '',
+        status text DEFAULT '',
+        incorporation_date text DEFAULT '',
+        authorized_capital text DEFAULT '',
+        paid_up_capital text DEFAULT '',
+        registered_address text DEFAULT '',
+        directors jsonb NOT NULL DEFAULT '[]'::jsonb,
+        charges jsonb NOT NULL DEFAULT '[]'::jsonb,
+        filings jsonb NOT NULL DEFAULT '[]'::jsonb,
+        ai_dd_summary text DEFAULT '',
+        red_flags jsonb NOT NULL DEFAULT '[]'::jsonb,
+        source_provider text NOT NULL,
+        source_date text NOT NULL,
+        is_mock_data boolean NOT NULL DEFAULT false,
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS evidence_items (
+        id text PRIMARY KEY,
+        organization_id text NOT NULL,
+        matter_id text NOT NULL,
+        user_id text NOT NULL,
+        exhibit_number text NOT NULL,
+        title text NOT NULL,
+        source_document_id text DEFAULT '',
+        witness_name text DEFAULT '',
+        admissibility_status text NOT NULL DEFAULT 'requires_certificate',
+        notes text DEFAULT '',
+        created_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS litigation_strategies (
+        id text PRIMARY KEY,
+        organization_id text NOT NULL,
+        matter_id text NOT NULL,
+        user_id text NOT NULL,
+        case_theory text DEFAULT '',
+        legal_issues jsonb NOT NULL DEFAULT '[]'::jsonb,
+        supporting_facts jsonb NOT NULL DEFAULT '[]'::jsonb,
+        adverse_facts jsonb NOT NULL DEFAULT '[]'::jsonb,
+        supporting_precedents jsonb NOT NULL DEFAULT '[]'::jsonb,
+        weaknesses jsonb NOT NULL DEFAULT '[]'::jsonb,
+        evidence_requirements jsonb NOT NULL DEFAULT '[]'::jsonb,
+        cross_exam_questions jsonb NOT NULL DEFAULT '[]'::jsonb,
+        ai_generated_disclaimer text NOT NULL DEFAULT 'AI-generated strategic analysis \u2014 review independently before court reliance.',
+        updated_at text NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS revoked_tokens (
+        jti text PRIMARY KEY,
+        expires_at bigint NOT NULL
+      );
+    `);
+    const migrations = [
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS organization_id text DEFAULT '';`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS org_role text NOT NULL DEFAULT 'advocate';`,
+      `ALTER TABLE matters ADD COLUMN IF NOT EXISTS organization_id text DEFAULT '';`,
+      `ALTER TABLE matters ADD COLUMN IF NOT EXISTS client_id text DEFAULT '';`,
+      `ALTER TABLE matters ADD COLUMN IF NOT EXISTS assigned_user_ids jsonb NOT NULL DEFAULT '[]'::jsonb;`,
+      `ALTER TABLE matters ADD COLUMN IF NOT EXISTS case_type text DEFAULT '';`,
+      `ALTER TABLE matters ADD COLUMN IF NOT EXISTS cnr_number text DEFAULT '';`,
+      `ALTER TABLE matters ADD COLUMN IF NOT EXISTS filing_date text DEFAULT '';`,
+      `ALTER TABLE matters ADD COLUMN IF NOT EXISTS assigned_advocate text DEFAULT '';`,
+      `ALTER TABLE research_memos ADD COLUMN IF NOT EXISTS organization_id text DEFAULT '';`,
+      `ALTER TABLE research_memos ADD COLUMN IF NOT EXISTS filters jsonb NOT NULL DEFAULT '{}'::jsonb;`,
+      `ALTER TABLE drafts ADD COLUMN IF NOT EXISTS organization_id text DEFAULT '';`,
+      `ALTER TABLE drafts ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'draft';`,
+      `ALTER TABLE drafts ADD COLUMN IF NOT EXISTS versions jsonb NOT NULL DEFAULT '[]'::jsonb;`,
+      `ALTER TABLE vault_documents ADD COLUMN IF NOT EXISTS organization_id text DEFAULT '';`,
+      `ALTER TABLE vault_documents ADD COLUMN IF NOT EXISTS file_size_bytes integer DEFAULT 0;`,
+      `ALTER TABLE vault_documents ADD COLUMN IF NOT EXISTS processing_status text NOT NULL DEFAULT 'completed';`,
+      `ALTER TABLE vault_documents ADD COLUMN IF NOT EXISTS processing_error text DEFAULT '';`,
+      `ALTER TABLE vault_documents ADD COLUMN IF NOT EXISTS entities jsonb NOT NULL DEFAULT '{}'::jsonb;`,
+      `ALTER TABLE contract_reviews ADD COLUMN IF NOT EXISTS organization_id text DEFAULT '';`,
+      `ALTER TABLE contract_reviews ADD COLUMN IF NOT EXISTS obligations jsonb NOT NULL DEFAULT '[]'::jsonb;`,
+      `ALTER TABLE contract_reviews ADD COLUMN IF NOT EXISTS renewal_date text DEFAULT '';`,
+      `ALTER TABLE contract_reviews ADD COLUMN IF NOT EXISTS termination_notice_date text DEFAULT '';`,
+      `CREATE INDEX IF NOT EXISTS idx_users_org ON users(organization_id);`,
+      `CREATE INDEX IF NOT EXISTS idx_matters_user ON matters(user_id);`,
+      `CREATE INDEX IF NOT EXISTS idx_matters_org ON matters(organization_id);`,
+      `CREATE INDEX IF NOT EXISTS idx_drafts_matter ON drafts(matter_id);`,
+      `CREATE INDEX IF NOT EXISTS idx_vault_matter ON vault_documents(matter_id);`,
+      `CREATE INDEX IF NOT EXISTS idx_memos_matter ON research_memos(matter_id);`,
+      `CREATE INDEX IF NOT EXISTS idx_cases_matter ON tracked_cases(matter_id);`,
+      `CREATE INDEX IF NOT EXISTS idx_deadlines_matter ON deadlines(matter_id);`,
+      `CREATE INDEX IF NOT EXISTS idx_tasks_org_matter ON tasks(organization_id, matter_id);`,
+      `CREATE INDEX IF NOT EXISTS idx_audit_org ON audit_events(organization_id, created_at);`,
+      `CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id, read);`
+    ];
+    for (const sql of migrations) {
+      await client.query(sql);
+    }
+    lastDbError = null;
+    schemaInitialized = true;
+    console.log("[Neon PostgreSQL] Schema & migrations verified in neondb.");
+  } catch (err) {
+    lastDbError = err instanceof Error ? err.message : "Schema initialization failed";
+    console.error("[Neon PostgreSQL] Schema verification error:", err);
+    throw err;
+  } finally {
+    client?.release();
+  }
+}
+async function loadStoreFromNeon() {
+  const pool = await getNeonPool();
+  if (!pool) return null;
+  try {
+    const [
+      organizations,
+      orgMembers,
+      users,
+      clients,
+      matters,
+      tasks,
+      hearings,
+      researchMemos,
+      drafts,
+      vaultDocs,
+      contractReviews,
+      courtroomSessions,
+      trackedCases,
+      deadlines,
+      meetingBriefs,
+      whatsappMsgs,
+      assistantMsgs,
+      notifications,
+      activityLogs,
+      auditEvents,
+      subscriptions,
+      workflowRuns,
+      corporateProfiles,
+      evidenceItems,
+      litigationStrategies,
+      revokedTokens
+    ] = await Promise.all([
+      pool.query("SELECT * FROM organizations;"),
+      pool.query("SELECT * FROM organization_members;"),
+      pool.query("SELECT * FROM users;"),
+      pool.query("SELECT * FROM clients;"),
+      pool.query("SELECT * FROM matters;"),
+      pool.query("SELECT * FROM tasks;"),
+      pool.query("SELECT * FROM hearings;"),
+      pool.query("SELECT * FROM research_memos;"),
+      pool.query("SELECT * FROM drafts;"),
+      pool.query("SELECT * FROM vault_documents;"),
+      pool.query("SELECT * FROM contract_reviews;"),
+      pool.query("SELECT * FROM courtroom_sessions;"),
+      pool.query("SELECT * FROM tracked_cases;"),
+      pool.query("SELECT * FROM deadlines;"),
+      pool.query("SELECT * FROM meeting_briefs;"),
+      pool.query("SELECT * FROM whatsapp_messages ORDER BY created_at ASC;"),
+      pool.query("SELECT * FROM assistant_messages ORDER BY created_at ASC;"),
+      pool.query("SELECT * FROM notifications ORDER BY created_at DESC;"),
+      pool.query("SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT 500;"),
+      pool.query("SELECT * FROM audit_events ORDER BY created_at DESC LIMIT 500;"),
+      pool.query("SELECT * FROM subscriptions;"),
+      pool.query("SELECT * FROM workflow_runs ORDER BY created_at DESC LIMIT 250;"),
+      pool.query("SELECT * FROM corporate_profiles ORDER BY created_at DESC;"),
+      pool.query("SELECT * FROM evidence_items;"),
+      pool.query("SELECT * FROM litigation_strategies;"),
+      pool.query("SELECT * FROM revoked_tokens WHERE expires_at > $1;", [Date.now()])
+    ]);
+    if (users.rows.length === 0 && matters.rows.length === 0) {
+      return null;
+    }
+    lastDbError = null;
+    return {
+      organizations: organizations.rows.map((o) => ({
+        id: o.id,
+        name: o.name,
+        slug: o.slug,
+        tier: o.tier || "PRO",
+        createdAt: o.created_at
+      })),
+      organizationMembers: orgMembers.rows.map((m) => ({
+        id: m.id,
+        organizationId: m.organization_id,
+        userId: m.user_id,
+        role: m.role,
+        permissions: Array.isArray(m.permissions) ? m.permissions : [],
+        createdAt: m.created_at
+      })),
+      users: users.rows.map((u) => ({
+        id: u.id,
+        email: u.email,
+        fullName: u.full_name,
+        role: u.role,
+        organization: u.organization || "",
+        organizationId: u.organization_id || "",
+        orgRole: u.org_role || "advocate",
+        defaultJurisdiction: u.default_jurisdiction,
+        isAdmin: Boolean(u.is_admin),
+        passwordHash: u.password_hash,
+        createdAt: u.created_at
+      })),
+      clients: clients.rows.map((c) => ({
+        id: c.id,
+        organizationId: c.organization_id,
+        userId: c.user_id,
+        name: c.name,
+        email: c.email || "",
+        phone: c.phone || "",
+        company: c.company || "",
+        address: c.address || "",
+        panOrCin: c.pan_or_cin || "",
+        notes: c.notes || "",
+        portalAccessEnabled: Boolean(c.portal_access_enabled),
+        createdAt: c.created_at
+      })),
+      matters: matters.rows.map((m) => ({
+        id: m.id,
+        userId: m.user_id,
+        organizationId: m.organization_id || "",
+        clientId: m.client_id || "",
+        assignedUserIds: Array.isArray(m.assigned_user_ids) ? m.assigned_user_ids : [],
+        title: m.title,
+        matterCode: m.matter_code,
+        clientName: m.client_name,
+        opposingParty: m.opposing_party || "",
+        jurisdiction: m.jurisdiction,
+        forum: m.forum,
+        caseType: m.case_type || "",
+        cnrNumber: m.cnr_number || "",
+        filingDate: m.filing_date || "",
+        assignedAdvocate: m.assigned_advocate || "",
+        status: m.status,
+        summaryFacts: m.summary_facts || "",
+        createdAt: m.created_at,
+        updatedAt: m.updated_at
+      })),
+      tasks: tasks.rows.map((t) => ({
+        id: t.id,
+        organizationId: t.organization_id,
+        matterId: t.matter_id,
+        userId: t.user_id,
+        assignedToUserId: t.assigned_to_user_id || void 0,
+        assignedToName: t.assigned_to_name || void 0,
+        title: t.title,
+        priority: t.priority,
+        status: t.status,
+        dueDate: t.due_date,
+        createdAt: t.created_at
+      })),
+      hearings: hearings.rows.map((h) => ({
+        id: h.id,
+        organizationId: h.organization_id,
+        matterId: h.matter_id,
+        trackedCaseId: h.tracked_case_id || void 0,
+        userId: h.user_id,
+        hearingDate: h.hearing_date,
+        court: h.court,
+        courtroom: h.courtroom || "",
+        bench: h.bench || "",
+        causeListItem: h.cause_list_item || "",
+        outcome: h.outcome,
+        nextHearingDate: h.next_hearing_date || void 0,
+        adjournmentReason: h.adjournment_reason || void 0,
+        notes: h.notes || "",
+        createdAt: h.created_at
+      })),
+      researchMemos: researchMemos.rows.map((r) => ({
+        id: r.id,
+        matterId: r.matter_id,
+        userId: r.user_id,
+        organizationId: r.organization_id || "",
+        query: r.query,
+        jurisdiction: r.jurisdiction,
+        filters: r.filters || void 0,
+        answerMarkdown: r.answer_markdown,
+        citations: r.citations,
+        citationIntegrity: r.citation_integrity,
+        createdAt: r.created_at
+      })),
+      drafts: drafts.rows.map((d) => ({
+        id: d.id,
+        matterId: d.matter_id,
+        userId: d.user_id,
+        organizationId: d.organization_id || "",
+        title: d.title,
+        docType: d.doc_type,
+        content: d.content,
+        status: d.status || "draft",
+        version: d.version,
+        versions: Array.isArray(d.versions) ? d.versions : [],
+        updatedAt: d.updated_at
+      })),
+      vaultDocuments: vaultDocs.rows.map((v) => ({
+        id: v.id,
+        matterId: v.matter_id,
+        userId: v.user_id,
+        organizationId: v.organization_id || "",
+        fileName: v.file_name,
+        mimeType: v.mime_type,
+        fileSizeBytes: Number(v.file_size_bytes || 0),
+        docCategory: v.doc_category,
+        processingStatus: v.processing_status || "completed",
+        processingError: v.processing_error || void 0,
+        extractedText: v.extracted_text,
+        translatedText: v.translated_text,
+        targetLanguage: v.target_language,
+        entities: v.entities && Object.keys(v.entities).length > 0 ? v.entities : void 0,
+        chronology: v.chronology,
+        contradictions: v.contradictions,
+        createdAt: v.created_at
+      })),
+      contractReviews: contractReviews.rows.map((c) => ({
+        id: c.id,
+        matterId: c.matter_id,
+        userId: c.user_id,
+        organizationId: c.organization_id || "",
+        title: c.title,
+        playbook: c.playbook,
+        sourceText: c.source_text,
+        summary: c.summary,
+        clauses: c.clauses,
+        requisitions: c.requisitions,
+        obligations: Array.isArray(c.obligations) ? c.obligations : [],
+        renewalDate: c.renewal_date || void 0,
+        terminationNoticeDate: c.termination_notice_date || void 0,
+        createdAt: c.created_at
+      })),
+      courtroomSessions: courtroomSessions.rows.map((s) => ({
+        id: s.id,
+        matterId: s.matter_id,
+        userId: s.user_id,
+        mode: s.mode,
+        forumContext: s.forum_context,
+        briefExcerpt: s.brief_excerpt,
+        turns: s.turns,
+        vulnerabilities: s.vulnerabilities,
+        createdAt: s.created_at
+      })),
+      trackedCases: trackedCases.rows.map((t) => ({
+        id: t.id,
+        matterId: t.matter_id,
+        userId: t.user_id,
+        caseNumber: t.case_number,
+        court: t.court,
+        courtroom: t.courtroom,
+        bench: t.bench,
+        causeListItem: t.cause_list_item,
+        nextHearingDate: t.next_hearing_date,
+        stage: t.stage,
+        notes: t.notes,
+        cnrNumber: t.cnr_number,
+        status: t.status,
+        createdAt: t.created_at
+      })),
+      deadlines: deadlines.rows.map((dl) => ({
+        id: dl.id,
+        matterId: dl.matter_id,
+        userId: dl.user_id,
+        title: dl.title,
+        statuteArticle: dl.statute_article || "",
+        triggerDate: dl.trigger_date || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
+        dueDate: dl.due_date,
+        graceDate: dl.grace_date || void 0,
+        completed: Boolean(dl.completed),
+        notes: dl.notes || "",
+        createdAt: dl.created_at || (/* @__PURE__ */ new Date()).toISOString()
+      })),
+      meetingBriefs: meetingBriefs.rows.map((mb) => ({
+        id: mb.id,
+        matterId: mb.matter_id,
+        userId: mb.user_id,
+        title: mb.title,
+        durationLabel: mb.duration_label,
+        transcript: mb.transcript,
+        summary: mb.summary,
+        keyFacts: mb.key_facts || [],
+        actionItems: mb.action_items || [],
+        statutoryIssues: mb.statutory_issues || [],
+        createdAt: mb.created_at
+      })),
+      whatsappMessages: whatsappMsgs.rows.map((w) => ({
+        id: w.id,
+        matterId: w.matter_id,
+        userId: w.user_id,
+        sender: w.sender,
+        body: w.body,
+        commandTag: w.command_tag || "",
+        createdAt: w.created_at
+      })),
+      assistantMessages: assistantMsgs.rows.map((a) => ({
+        id: a.id,
+        userId: a.user_id,
+        matterId: a.matter_id,
+        role: a.role,
+        content: a.content,
+        languageUsed: a.language_used,
+        verificationMode: a.verification_mode,
+        confidenceNote: a.confidence_note,
+        sources: a.sources,
+        completedActions: a.completed_actions,
+        createdAt: a.created_at
+      })),
+      notifications: notifications.rows.map((n) => ({
+        id: n.id,
+        organizationId: n.organization_id,
+        userId: n.user_id,
+        title: n.title,
+        message: n.message,
+        kind: n.kind,
+        read: Boolean(n.read),
+        linkSection: n.link_section || "overview",
+        createdAt: n.created_at
+      })),
+      activityLogs: activityLogs.rows.map((al) => ({
+        id: al.id,
+        organizationId: al.organization_id,
+        userId: al.user_id,
+        actorName: al.actor_name,
+        matterId: al.matter_id || void 0,
+        action: al.action,
+        entityType: al.entity_type,
+        entityId: al.entity_id || void 0,
+        summary: al.summary,
+        createdAt: al.created_at
+      })),
+      auditEvents: auditEvents.rows.map((ae) => ({
+        id: ae.id,
+        organizationId: ae.organization_id,
+        userId: ae.user_id,
+        actorEmail: ae.actor_email,
+        eventType: ae.event_type,
+        resourceType: ae.resource_type,
+        resourceId: ae.resource_id || void 0,
+        ipAddress: ae.ip_address || void 0,
+        status: ae.status,
+        details: ae.details,
+        createdAt: ae.created_at
+      })),
+      subscriptions: subscriptions.rows.map((sub) => ({
+        id: sub.id,
+        organizationId: sub.organization_id,
+        tier: sub.tier,
+        status: sub.status,
+        aiQueriesLimit: Number(sub.ai_queries_limit),
+        aiQueriesUsed: Number(sub.ai_queries_used),
+        aiTokensUsed: Number(sub.ai_tokens_used),
+        storageLimitMb: Number(sub.storage_limit_mb),
+        storageUsedMb: Number(sub.storage_used_mb),
+        maxMatters: Number(sub.max_matters),
+        maxSeats: Number(sub.max_seats),
+        expiresAt: sub.expires_at,
+        updatedAt: sub.updated_at
+      })),
+      workflowRuns: workflowRuns.rows.map((wr) => ({
+        id: wr.id,
+        organizationId: wr.organization_id,
+        userId: wr.user_id,
+        matterId: wr.matter_id,
+        workflowType: wr.workflow_type,
+        goal: wr.goal,
+        status: wr.status,
+        requiresHumanApproval: Boolean(wr.requires_human_approval),
+        approvedByUserId: wr.approved_by_user_id || void 0,
+        totalTokens: Number(wr.total_tokens || 0),
+        totalLatencyMs: Number(wr.total_latency_ms || 0),
+        steps: wr.steps || [],
+        finalOutput: wr.final_output || "",
+        createdAt: wr.created_at
+      })),
+      corporateProfiles: corporateProfiles.rows.map((cp) => ({
+        id: cp.id,
+        organizationId: cp.organization_id,
+        userId: cp.user_id,
+        matterId: cp.matter_id || void 0,
+        cin: cp.cin,
+        companyName: cp.company_name,
+        roc: cp.roc || "",
+        status: cp.status || "",
+        incorporationDate: cp.incorporation_date || "",
+        authorizedCapital: cp.authorized_capital || "",
+        paidUpCapital: cp.paid_up_capital || "",
+        registeredAddress: cp.registered_address || "",
+        directors: cp.directors || [],
+        charges: cp.charges || [],
+        filings: cp.filings || [],
+        aiDueDiligenceSummary: cp.ai_dd_summary || "",
+        redFlags: cp.red_flags || [],
+        sourceProvider: cp.source_provider,
+        sourceDate: cp.source_date,
+        isMockData: Boolean(cp.is_mock_data),
+        createdAt: cp.created_at
+      })),
+      evidenceItems: evidenceItems.rows.map((ev) => ({
+        id: ev.id,
+        organizationId: ev.organization_id,
+        matterId: ev.matter_id,
+        userId: ev.user_id,
+        exhibitNumber: ev.exhibit_number,
+        title: ev.title,
+        sourceDocumentId: ev.source_document_id || void 0,
+        witnessName: ev.witness_name || void 0,
+        admissibilityStatus: ev.admissibility_status,
+        notes: ev.notes || "",
+        createdAt: ev.created_at
+      })),
+      litigationStrategies: litigationStrategies.rows.map((ls) => ({
+        id: ls.id,
+        organizationId: ls.organization_id,
+        matterId: ls.matter_id,
+        userId: ls.user_id,
+        caseTheory: ls.case_theory || "",
+        legalIssues: ls.legal_issues || [],
+        supportingFacts: ls.supporting_facts || [],
+        adverseFacts: ls.adverse_facts || [],
+        supportingPrecedents: ls.supporting_precedents || [],
+        weaknesses: ls.weaknesses || [],
+        evidenceRequirements: ls.evidence_requirements || [],
+        crossExamQuestions: ls.cross_exam_questions || [],
+        aiGeneratedDisclaimer: ls.ai_generated_disclaimer,
+        updatedAt: ls.updated_at
+      })),
+      revokedTokens: revokedTokens.rows.map((rt) => ({
+        jti: rt.jti,
+        expiresAt: Number(rt.expires_at)
+      }))
+    };
+  } catch (err) {
+    lastDbError = err instanceof Error ? err.message : "Failed to load store from Neon";
+    console.error("[Neon PostgreSQL] Failed to load store from Neon database:", err);
+    throw err;
+  }
+}
+async function persistStoreToNeon(state) {
+  const pool = await getNeonPool();
+  if (!pool) return;
+  let client = null;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    for (const o of state.organizations) {
+      await client.query(
+        `INSERT INTO organizations (id, name, slug, tier, created_at)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, tier = EXCLUDED.tier;`,
+        [o.id, o.name, o.slug, o.tier, o.createdAt]
+      );
+    }
+    for (const om of state.organizationMembers) {
+      await client.query(
+        `INSERT INTO organization_members (id, organization_id, user_id, role, permissions, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (id) DO UPDATE SET role = EXCLUDED.role, permissions = EXCLUDED.permissions;`,
+        [om.id, om.organizationId, om.userId, om.role, JSON.stringify(om.permissions), om.createdAt]
+      );
+    }
+    for (const u of state.users) {
+      await client.query(
+        `INSERT INTO users (id, email, full_name, role, organization, organization_id, org_role, default_jurisdiction, is_admin, password_hash, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (email) DO UPDATE SET
+           full_name = EXCLUDED.full_name,
+           role = EXCLUDED.role,
+           organization = EXCLUDED.organization,
+           organization_id = EXCLUDED.organization_id,
+           org_role = EXCLUDED.org_role,
+           default_jurisdiction = EXCLUDED.default_jurisdiction,
+           is_admin = EXCLUDED.is_admin,
+           password_hash = EXCLUDED.password_hash;`,
+        [
+          u.id,
+          u.email,
+          u.fullName,
+          u.role,
+          u.organization,
+          u.organizationId || "",
+          u.orgRole || "advocate",
+          u.defaultJurisdiction,
+          Boolean(u.isAdmin),
+          u.passwordHash,
+          u.createdAt
+        ]
+      );
+    }
+    for (const c of state.clients) {
+      await client.query(
+        `INSERT INTO clients (id, organization_id, user_id, name, email, phone, company, address, pan_or_cin, notes, portal_access_enabled, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name, email = EXCLUDED.email, phone = EXCLUDED.phone,
+           company = EXCLUDED.company, address = EXCLUDED.address, notes = EXCLUDED.notes,
+           portal_access_enabled = EXCLUDED.portal_access_enabled;`,
+        [
+          c.id,
+          c.organizationId,
+          c.userId,
+          c.name,
+          c.email,
+          c.phone,
+          c.company,
+          c.address,
+          c.panOrCin || "",
+          c.notes,
+          Boolean(c.portalAccessEnabled),
+          c.createdAt
+        ]
+      );
+    }
+    for (const m of state.matters) {
+      await client.query(
+        `INSERT INTO matters (id, user_id, organization_id, client_id, assigned_user_ids, title, matter_code, client_name, opposing_party, jurisdiction, forum, case_type, cnr_number, filing_date, assigned_advocate, status, summary_facts, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+         ON CONFLICT (id) DO UPDATE SET
+           organization_id = EXCLUDED.organization_id,
+           client_id = EXCLUDED.client_id,
+           assigned_user_ids = EXCLUDED.assigned_user_ids,
+           title = EXCLUDED.title,
+           opposing_party = EXCLUDED.opposing_party,
+           forum = EXCLUDED.forum,
+           case_type = EXCLUDED.case_type,
+           cnr_number = EXCLUDED.cnr_number,
+           assigned_advocate = EXCLUDED.assigned_advocate,
+           status = EXCLUDED.status,
+           summary_facts = EXCLUDED.summary_facts,
+           updated_at = EXCLUDED.updated_at;`,
+        [
+          m.id,
+          m.userId,
+          m.organizationId || "",
+          m.clientId || "",
+          JSON.stringify(m.assignedUserIds || []),
+          m.title,
+          m.matterCode,
+          m.clientName,
+          m.opposingParty,
+          m.jurisdiction,
+          m.forum,
+          m.caseType || "",
+          m.cnrNumber || "",
+          m.filingDate || "",
+          m.assignedAdvocate || "",
+          m.status,
+          m.summaryFacts,
+          m.createdAt,
+          m.updatedAt
+        ]
+      );
+    }
+    for (const t of state.tasks) {
+      await client.query(
+        `INSERT INTO tasks (id, organization_id, matter_id, user_id, assigned_to_user_id, assigned_to_name, title, priority, status, due_date, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, priority = EXCLUDED.priority, assigned_to_user_id = EXCLUDED.assigned_to_user_id, assigned_to_name = EXCLUDED.assigned_to_name;`,
+        [
+          t.id,
+          t.organizationId,
+          t.matterId,
+          t.userId,
+          t.assignedToUserId || "",
+          t.assignedToName || "",
+          t.title,
+          t.priority,
+          t.status,
+          t.dueDate,
+          t.createdAt
+        ]
+      );
+    }
+    for (const h of state.hearings) {
+      await client.query(
+        `INSERT INTO hearings (id, organization_id, matter_id, tracked_case_id, user_id, hearing_date, court, courtroom, bench, cause_list_item, outcome, next_hearing_date, adjournment_reason, notes, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         ON CONFLICT (id) DO UPDATE SET outcome = EXCLUDED.outcome, next_hearing_date = EXCLUDED.next_hearing_date, adjournment_reason = EXCLUDED.adjournment_reason, notes = EXCLUDED.notes;`,
+        [
+          h.id,
+          h.organizationId,
+          h.matterId,
+          h.trackedCaseId || "",
+          h.userId,
+          h.hearingDate,
+          h.court,
+          h.courtroom,
+          h.bench,
+          h.causeListItem,
+          h.outcome,
+          h.nextHearingDate || "",
+          h.adjournmentReason || "",
+          h.notes,
+          h.createdAt
+        ]
+      );
+    }
+    for (const d of state.drafts) {
+      await client.query(
+        `INSERT INTO drafts (id, matter_id, user_id, organization_id, title, doc_type, content, status, version, versions, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (id) DO UPDATE SET
+           title = EXCLUDED.title,
+           content = EXCLUDED.content,
+           status = EXCLUDED.status,
+           version = EXCLUDED.version,
+           versions = EXCLUDED.versions,
+           updated_at = EXCLUDED.updated_at;`,
+        [
+          d.id,
+          d.matterId,
+          d.userId,
+          d.organizationId || "",
+          d.title,
+          d.docType,
+          d.content,
+          d.status || "draft",
+          d.version,
+          JSON.stringify(d.versions || []),
+          d.updatedAt
+        ]
+      );
+    }
+    for (const r of state.researchMemos) {
+      await client.query(
+        `INSERT INTO research_memos (id, matter_id, user_id, organization_id, query, jurisdiction, filters, answer_markdown, citations, citation_integrity, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (id) DO NOTHING;`,
+        [
+          r.id,
+          r.matterId,
+          r.userId,
+          r.organizationId || "",
+          r.query,
+          r.jurisdiction,
+          JSON.stringify(r.filters || {}),
+          r.answerMarkdown,
+          JSON.stringify(r.citations),
+          JSON.stringify(r.citationIntegrity),
+          r.createdAt
+        ]
+      );
+    }
+    for (const v of state.vaultDocuments) {
+      await client.query(
+        `INSERT INTO vault_documents (id, matter_id, user_id, organization_id, file_name, mime_type, file_size_bytes, doc_category, processing_status, processing_error, extracted_text, translated_text, target_language, entities, chronology, contradictions, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+         ON CONFLICT (id) DO UPDATE SET
+           processing_status = EXCLUDED.processing_status,
+           processing_error = EXCLUDED.processing_error,
+           extracted_text = EXCLUDED.extracted_text,
+           translated_text = EXCLUDED.translated_text,
+           entities = EXCLUDED.entities,
+           chronology = EXCLUDED.chronology,
+           contradictions = EXCLUDED.contradictions;`,
+        [
+          v.id,
+          v.matterId,
+          v.userId,
+          v.organizationId || "",
+          v.fileName,
+          v.mimeType,
+          v.fileSizeBytes || 0,
+          v.docCategory,
+          v.processingStatus || "completed",
+          v.processingError || "",
+          v.extractedText,
+          v.translatedText || "",
+          v.targetLanguage || "",
+          JSON.stringify(v.entities || {}),
+          JSON.stringify(v.chronology),
+          JSON.stringify(v.contradictions),
+          v.createdAt
+        ]
+      );
+    }
+    for (const dl of state.deadlines) {
+      await client.query(
+        `INSERT INTO deadlines (id, matter_id, user_id, title, statute_article, trigger_date, due_date, grace_date, completed, notes, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (id) DO UPDATE SET completed = EXCLUDED.completed, notes = EXCLUDED.notes;`,
+        [
+          dl.id,
+          dl.matterId,
+          dl.userId,
+          dl.title,
+          dl.statuteArticle || "",
+          dl.triggerDate,
+          dl.dueDate,
+          dl.graceDate || null,
+          dl.completed,
+          dl.notes || "",
+          dl.createdAt
+        ]
+      );
+    }
+    for (const cr of state.contractReviews) {
+      await client.query(
+        `INSERT INTO contract_reviews (id, matter_id, user_id, organization_id, title, playbook, source_text, summary, clauses, requisitions, obligations, renewal_date, termination_notice_date, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         ON CONFLICT (id) DO UPDATE SET clauses = EXCLUDED.clauses, summary = EXCLUDED.summary;`,
+        [
+          cr.id,
+          cr.matterId,
+          cr.userId,
+          cr.organizationId || "",
+          cr.title,
+          cr.playbook,
+          cr.sourceText,
+          cr.summary,
+          JSON.stringify(cr.clauses),
+          JSON.stringify(cr.requisitions),
+          JSON.stringify(cr.obligations || []),
+          cr.renewalDate || "",
+          cr.terminationNoticeDate || "",
+          cr.createdAt
+        ]
+      );
+    }
+    for (const cs of state.courtroomSessions) {
+      await client.query(
+        `INSERT INTO courtroom_sessions (id, matter_id, user_id, mode, forum_context, brief_excerpt, turns, vulnerabilities, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (id) DO UPDATE SET turns = EXCLUDED.turns, vulnerabilities = EXCLUDED.vulnerabilities;`,
+        [
+          cs.id,
+          cs.matterId,
+          cs.userId,
+          cs.mode,
+          cs.forumContext,
+          cs.briefExcerpt,
+          JSON.stringify(cs.turns),
+          JSON.stringify(cs.vulnerabilities),
+          cs.createdAt
+        ]
+      );
+    }
+    for (const tc of state.trackedCases) {
+      await client.query(
+        `INSERT INTO tracked_cases (id, matter_id, user_id, case_number, court, courtroom, bench, cause_list_item, next_hearing_date, stage, notes, cnr_number, status, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         ON CONFLICT (id) DO UPDATE SET
+           status = EXCLUDED.status,
+           next_hearing_date = EXCLUDED.next_hearing_date,
+           stage = EXCLUDED.stage,
+           notes = EXCLUDED.notes,
+           updated_at = EXCLUDED.updated_at;`,
+        [
+          tc.id,
+          tc.matterId,
+          tc.userId,
+          tc.caseNumber,
+          tc.court,
+          tc.courtroom || "",
+          tc.bench || "",
+          tc.causeListItem || "",
+          tc.nextHearingDate,
+          tc.stage,
+          tc.notes || "",
+          tc.cnrNumber || "",
+          tc.status,
+          tc.createdAt,
+          tc.createdAt
+        ]
+      );
+    }
+    for (const mb of state.meetingBriefs) {
+      await client.query(
+        `INSERT INTO meeting_briefs (id, matter_id, user_id, title, duration_label, transcript, summary, key_facts, action_items, statutory_issues, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (id) DO NOTHING;`,
+        [
+          mb.id,
+          mb.matterId,
+          mb.userId,
+          mb.title,
+          mb.durationLabel,
+          mb.transcript,
+          mb.summary,
+          JSON.stringify(mb.keyFacts),
+          JSON.stringify(mb.actionItems),
+          JSON.stringify(mb.statutoryIssues),
+          mb.createdAt
+        ]
+      );
+    }
+    for (const wm of state.whatsappMessages.slice(-200)) {
+      await client.query(
+        `INSERT INTO whatsapp_messages (id, matter_id, user_id, sender, body, command_tag, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (id) DO NOTHING;`,
+        [wm.id, wm.matterId, wm.userId, wm.sender, wm.body, wm.commandTag, wm.createdAt]
+      );
+    }
+    for (const am of state.assistantMessages.slice(-300)) {
+      await client.query(
+        `INSERT INTO assistant_messages (id, user_id, matter_id, role, content, language_used, verification_mode, confidence_note, sources, completed_actions, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (id) DO NOTHING;`,
+        [
+          am.id,
+          am.userId,
+          am.matterId,
+          am.role,
+          am.content,
+          am.languageUsed,
+          am.verificationMode,
+          am.confidenceNote || "",
+          JSON.stringify(am.sources),
+          JSON.stringify(am.completedActions),
+          am.createdAt
+        ]
+      );
+    }
+    for (const n of state.notifications.slice(0, 200)) {
+      await client.query(
+        `INSERT INTO notifications (id, organization_id, user_id, title, message, kind, read, link_section, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (id) DO UPDATE SET read = EXCLUDED.read;`,
+        [
+          n.id,
+          n.organizationId,
+          n.userId,
+          n.title,
+          n.message,
+          n.kind,
+          Boolean(n.read),
+          n.linkSection || "overview",
+          n.createdAt
+        ]
+      );
+    }
+    for (const al of state.activityLogs.slice(0, 250)) {
+      await client.query(
+        `INSERT INTO activity_logs (id, organization_id, user_id, actor_name, matter_id, action, entity_type, entity_id, summary, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         ON CONFLICT (id) DO NOTHING;`,
+        [
+          al.id,
+          al.organizationId,
+          al.userId,
+          al.actorName,
+          al.matterId || "",
+          al.action,
+          al.entityType,
+          al.entityId || "",
+          al.summary,
+          al.createdAt
+        ]
+      );
+    }
+    for (const ae of state.auditEvents.slice(0, 250)) {
+      await client.query(
+        `INSERT INTO audit_events (id, organization_id, user_id, actor_email, event_type, resource_type, resource_id, ip_address, status, details, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (id) DO NOTHING;`,
+        [
+          ae.id,
+          ae.organizationId,
+          ae.userId,
+          ae.actorEmail,
+          ae.eventType,
+          ae.resourceType,
+          ae.resourceId || "",
+          ae.ipAddress || "",
+          ae.status,
+          ae.details,
+          ae.createdAt
+        ]
+      );
+    }
+    for (const sub of state.subscriptions) {
+      await client.query(
+        `INSERT INTO subscriptions (id, organization_id, tier, status, ai_queries_limit, ai_queries_used, ai_tokens_used, storage_limit_mb, storage_used_mb, max_matters, max_seats, expires_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         ON CONFLICT (organization_id) DO UPDATE SET
+           tier = EXCLUDED.tier,
+           status = EXCLUDED.status,
+           ai_queries_limit = EXCLUDED.ai_queries_limit,
+           ai_queries_used = EXCLUDED.ai_queries_used,
+           ai_tokens_used = EXCLUDED.ai_tokens_used,
+           storage_limit_mb = EXCLUDED.storage_limit_mb,
+           storage_used_mb = EXCLUDED.storage_used_mb,
+           max_matters = EXCLUDED.max_matters,
+           max_seats = EXCLUDED.max_seats,
+           expires_at = EXCLUDED.expires_at,
+           updated_at = EXCLUDED.updated_at;`,
+        [
+          sub.id,
+          sub.organizationId,
+          sub.tier,
+          sub.status,
+          sub.aiQueriesLimit,
+          sub.aiQueriesUsed,
+          sub.aiTokensUsed,
+          sub.storageLimitMb,
+          sub.storageUsedMb,
+          sub.maxMatters,
+          sub.maxSeats,
+          sub.expiresAt,
+          sub.updatedAt
+        ]
+      );
+    }
+    for (const wr of state.workflowRuns.slice(0, 120)) {
+      await client.query(
+        `INSERT INTO workflow_runs (id, organization_id, user_id, matter_id, workflow_type, goal, status, requires_human_approval, approved_by_user_id, total_tokens, total_latency_ms, steps, final_output, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         ON CONFLICT (id) DO UPDATE SET
+           status = EXCLUDED.status,
+           approved_by_user_id = EXCLUDED.approved_by_user_id,
+           steps = EXCLUDED.steps,
+           final_output = EXCLUDED.final_output;`,
+        [
+          wr.id,
+          wr.organizationId,
+          wr.userId,
+          wr.matterId,
+          wr.workflowType,
+          wr.goal,
+          wr.status,
+          Boolean(wr.requiresHumanApproval),
+          wr.approvedByUserId || "",
+          wr.totalTokens,
+          wr.totalLatencyMs,
+          JSON.stringify(wr.steps),
+          wr.finalOutput,
+          wr.createdAt
+        ]
+      );
+    }
+    for (const cp of state.corporateProfiles) {
+      await client.query(
+        `INSERT INTO corporate_profiles (id, organization_id, user_id, matter_id, cin, company_name, roc, status, incorporation_date, authorized_capital, paid_up_capital, registered_address, directors, charges, filings, ai_dd_summary, red_flags, source_provider, source_date, is_mock_data, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+         ON CONFLICT (id) DO NOTHING;`,
+        [
+          cp.id,
+          cp.organizationId,
+          cp.userId,
+          cp.matterId || "",
+          cp.cin,
+          cp.companyName,
+          cp.roc,
+          cp.status,
+          cp.incorporationDate,
+          cp.authorizedCapital,
+          cp.paidUpCapital,
+          cp.registeredAddress,
+          JSON.stringify(cp.directors),
+          JSON.stringify(cp.charges),
+          JSON.stringify(cp.filings),
+          cp.aiDueDiligenceSummary,
+          JSON.stringify(cp.redFlags),
+          cp.sourceProvider,
+          cp.sourceDate,
+          Boolean(cp.isMockData),
+          cp.createdAt
+        ]
+      );
+    }
+    for (const ev of state.evidenceItems) {
+      await client.query(
+        `INSERT INTO evidence_items (id, organization_id, matter_id, user_id, exhibit_number, title, source_document_id, witness_name, admissibility_status, notes, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (id) DO UPDATE SET admissibility_status = EXCLUDED.admissibility_status, notes = EXCLUDED.notes;`,
+        [
+          ev.id,
+          ev.organizationId,
+          ev.matterId,
+          ev.userId,
+          ev.exhibitNumber,
+          ev.title,
+          ev.sourceDocumentId || "",
+          ev.witnessName || "",
+          ev.admissibilityStatus,
+          ev.notes,
+          ev.createdAt
+        ]
+      );
+    }
+    for (const ls of state.litigationStrategies) {
+      await client.query(
+        `INSERT INTO litigation_strategies (id, organization_id, matter_id, user_id, case_theory, legal_issues, supporting_facts, adverse_facts, supporting_precedents, weaknesses, evidence_requirements, cross_exam_questions, ai_generated_disclaimer, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         ON CONFLICT (id) DO UPDATE SET
+           case_theory = EXCLUDED.case_theory,
+           legal_issues = EXCLUDED.legal_issues,
+           supporting_facts = EXCLUDED.supporting_facts,
+           adverse_facts = EXCLUDED.adverse_facts,
+           supporting_precedents = EXCLUDED.supporting_precedents,
+           weaknesses = EXCLUDED.weaknesses,
+           evidence_requirements = EXCLUDED.evidence_requirements,
+           cross_exam_questions = EXCLUDED.cross_exam_questions,
+           updated_at = EXCLUDED.updated_at;`,
+        [
+          ls.id,
+          ls.organizationId,
+          ls.matterId,
+          ls.userId,
+          ls.caseTheory,
+          JSON.stringify(ls.legalIssues),
+          JSON.stringify(ls.supportingFacts),
+          JSON.stringify(ls.adverseFacts),
+          JSON.stringify(ls.supportingPrecedents),
+          JSON.stringify(ls.weaknesses),
+          JSON.stringify(ls.evidenceRequirements),
+          JSON.stringify(ls.crossExamQuestions),
+          ls.aiGeneratedDisclaimer,
+          ls.updatedAt
+        ]
+      );
+    }
+    for (const rt of state.revokedTokens) {
+      await client.query(
+        `INSERT INTO revoked_tokens (jti, expires_at) VALUES ($1, $2) ON CONFLICT (jti) DO NOTHING;`,
+        [rt.jti, rt.expiresAt]
+      );
+    }
+    await client.query("COMMIT");
+    lastDbError = null;
+    lastDbSyncAt = (/* @__PURE__ */ new Date()).toISOString();
+  } catch (err) {
+    await client?.query("ROLLBACK").catch(() => {
+    });
+    lastDbError = err instanceof Error ? err.message : "Failed to persist store snapshot to Neon";
+    console.error("[Neon PostgreSQL] Failed to sync store snapshot:", err);
+    throw err;
+  } finally {
+    client?.release();
+  }
+}
+async function deleteUserFromNeon(userId) {
+  const pool = await getNeonPool();
+  if (!pool) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("DELETE FROM assistant_messages WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM whatsapp_messages WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM meeting_briefs WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM notifications WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM tasks WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM hearings WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM deadlines WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM tracked_cases WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM courtroom_sessions WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM contract_reviews WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM vault_documents WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM research_memos WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM drafts WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM evidence_items WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM litigation_strategies WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM matters WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM clients WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM organization_members WHERE user_id = $1;", [userId]);
+    await client.query("DELETE FROM users WHERE id = $1;", [userId]);
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {
+    });
+    lastDbError = err instanceof Error ? err.message : "Failed to delete user from Neon";
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+async function deleteMatterFromNeon(matterId) {
+  const pool = await getNeonPool();
+  if (!pool) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("DELETE FROM tasks WHERE matter_id = $1;", [matterId]);
+    await client.query("DELETE FROM hearings WHERE matter_id = $1;", [matterId]);
+    await client.query("DELETE FROM deadlines WHERE matter_id = $1;", [matterId]);
+    await client.query("DELETE FROM tracked_cases WHERE matter_id = $1;", [matterId]);
+    await client.query("DELETE FROM courtroom_sessions WHERE matter_id = $1;", [matterId]);
+    await client.query("DELETE FROM contract_reviews WHERE matter_id = $1;", [matterId]);
+    await client.query("DELETE FROM vault_documents WHERE matter_id = $1;", [matterId]);
+    await client.query("DELETE FROM research_memos WHERE matter_id = $1;", [matterId]);
+    await client.query("DELETE FROM drafts WHERE matter_id = $1;", [matterId]);
+    await client.query("DELETE FROM meeting_briefs WHERE matter_id = $1;", [matterId]);
+    await client.query("DELETE FROM evidence_items WHERE matter_id = $1;", [matterId]);
+    await client.query("DELETE FROM litigation_strategies WHERE matter_id = $1;", [matterId]);
+    await client.query("DELETE FROM matters WHERE id = $1;", [matterId]);
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {
+    });
+    lastDbError = err instanceof Error ? err.message : "Failed to delete matter from Neon";
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+async function clearAssistantMessagesFromNeon(userId) {
+  const pool = await getNeonPool();
+  if (!pool) return;
+  await pool.query("DELETE FROM assistant_messages WHERE user_id = $1;", [userId]);
+}
+
+// src/server/intelligenceService.ts
+var SUPPORTED_TRANSLATION_LANGUAGES = [
+  "English",
+  "Hindi",
+  "Odia",
+  "Bengali",
+  "Tamil",
+  "Telugu",
+  "Marathi",
+  "Gujarati",
+  "Kannada",
+  "Malayalam"
+];
+function buildMatterKnowledgeGraph(input) {
+  const nodes = [];
+  const edges = [];
+  const seenIds = /* @__PURE__ */ new Set();
+  const addNode = (id, label, category) => {
+    if (!id || !label || seenIds.has(id)) return;
+    seenIds.add(id);
+    nodes.push({ id, label, category });
+  };
+  if (!input.matter) {
+    return { nodes, edges };
+  }
+  const mId = `matter:${input.matter.id}`;
+  addNode(mId, `${input.matter.matterCode}: ${input.matter.title}`, "matter");
+  if (input.matter.clientName) {
+    const cId = `party:client:${input.matter.clientName}`;
+    addNode(cId, input.matter.clientName, "party");
+    edges.push({ from: mId, to: cId, relation: "client" });
+  }
+  if (input.matter.opposingParty) {
+    const oId = `party:opp:${input.matter.opposingParty}`;
+    addNode(oId, input.matter.opposingParty, "party");
+    edges.push({ from: mId, to: oId, relation: "opposing_party" });
+  }
+  if (input.matter.forum) {
+    const fId = `court:${input.matter.forum}`;
+    addNode(fId, input.matter.forum, "court");
+    edges.push({ from: mId, to: fId, relation: "pending_before" });
+  }
+  const legacyMatches = scanDraftForLegacyCitations(input.matter.summaryFacts);
+  for (const match of legacyMatches.slice(0, 6)) {
+    const sId = `statute:${match.mapping.newCode}-${match.mapping.newSection}`;
+    addNode(sId, `${match.mapping.newCode} Sec. ${match.mapping.newSection} (${match.mapping.title})`, "statute");
+    edges.push({ from: mId, to: sId, relation: "invokes_statute" });
+  }
+  const precedents = retrieveRelevantPrecedents(
+    `${input.matter.title} ${input.matter.summaryFacts}`,
+    input.matter.jurisdiction,
+    4
+  );
+  for (const p of precedents) {
+    const jId = `judgment:${p.id}`;
+    addNode(jId, `${p.caseName} (${p.citation})`, "judgment");
+    edges.push({ from: mId, to: jId, relation: "governed_by_precedent" });
+    for (const st of p.statutes.slice(0, 2)) {
+      const stId = `statute:${st}`;
+      addNode(stId, st, "statute");
+      edges.push({ from: jId, to: stId, relation: "interprets" });
+    }
+  }
+  for (const memo of input.memos.slice(0, 4)) {
+    for (const cit of memo.citations.slice(0, 3)) {
+      const jId = `judgment:${cit.title}`;
+      addNode(jId, cit.title, "judgment");
+      edges.push({ from: mId, to: jId, relation: "researched_authority" });
+    }
+  }
+  for (const doc of input.vaultDocuments.slice(0, 6)) {
+    const dId = `doc:${doc.id}`;
+    addNode(dId, `${doc.fileName} (${doc.docCategory})`, "document");
+    edges.push({ from: mId, to: dId, relation: "contains_exhibit" });
+  }
+  return { nodes, edges };
+}
+async function generateLitigationStrategy(input) {
+  const precedents = retrieveRelevantPrecedents(
+    `${input.matter.title} ${input.matter.summaryFacts}`,
+    input.matter.jurisdiction,
+    4
+  );
+  const legacyFlags = scanDraftForLegacyCitations(input.matter.summaryFacts);
+  if (getNvidiaConfig().configured) {
+    try {
+      const res = await callNvidiaChat({
+        systemPrompt: buildSupremeCourtSystemPrompt(
+          input.matter.jurisdiction,
+          'Prepare a structured Litigation Strategy Board as valid JSON with keys: "caseTheory" (string), "legalIssues" (string[]), "supportingFacts" (string[]), "adverseFacts" (string[]), "supportingPrecedents" (string[]), "weaknesses" (string[]), "evidenceRequirements" (string[]), "crossExamQuestions" (string[]).'
+        ),
+        userPrompt: `Matter: ${input.matter.title} (${input.matter.matterCode})
+Forum: ${input.matter.forum}
+Client: ${input.matter.clientName}
+Opposing: ${input.matter.opposingParty}
+Facts:
+${input.matter.summaryFacts}
+
+Verified Precedents:
+${precedents.map((p) => `- ${p.caseName} (${p.citation}): ${p.ratio}`).join("\n")}`,
+        tier: "expert",
+        jsonMode: true,
+        maxTokens: 1800
+      });
+      const parsed = extractJsonFromText(res.text);
+      return {
+        organizationId: input.organizationId,
+        matterId: input.matter.id,
+        userId: input.userId,
+        caseTheory: parsed.caseTheory || "Primary theory anchored in documentary chronology and statutory compliance.",
+        legalIssues: parsed.legalIssues ?? [],
+        supportingFacts: parsed.supportingFacts ?? [],
+        adverseFacts: parsed.adverseFacts ?? [],
+        supportingPrecedents: parsed.supportingPrecedents ?? precedents.map((p) => `${p.caseName} (${p.citation})`),
+        weaknesses: parsed.weaknesses ?? [],
+        evidenceRequirements: parsed.evidenceRequirements ?? [],
+        crossExamQuestions: parsed.crossExamQuestions ?? [],
+        aiGeneratedDisclaimer: "AI-generated strategic analysis. Verify all authorities, factual citations, and procedural strategy independently before court submissions."
+      };
+    } catch {
+    }
+  }
+  return {
+    organizationId: input.organizationId,
+    matterId: input.matter.id,
+    userId: input.userId,
+    caseTheory: `Establish maintainable relief before ${input.matter.forum} on behalf of ${input.matter.clientName} by anchoring documentary records and statutory compliance under current BNS/BNSS/BSA 2023 and commercial statutes.`,
+    legalIssues: [
+      `Whether ${input.matter.forum} has territorial and subject-matter jurisdiction.`,
+      "Whether statutory preconditions (notice, arbitration clause, or preliminary inquiry) were satisfied.",
+      ...legacyFlags.length > 0 ? [`Transitional application of ${legacyFlags.map((f) => f.mapping.newCode + " " + f.mapping.newSection).join(", ")}.`] : []
+    ],
+    supportingFacts: [
+      input.matter.summaryFacts.slice(0, 260) || "Documentary record filed on docket."
+    ],
+    adverseFacts: [
+      `Potential counter-allegations raised by ${input.matter.opposingParty || "Opposing Party"} requiring documentary rebuttal.`
+    ],
+    supportingPrecedents: precedents.map((p) => `${p.caseName} (${p.citation}) \u2014 ${p.ratio}`),
+    weaknesses: [
+      "Admissibility of uncertified electronic communications unless accompanied by Sec. 63(4) BSA certificate.",
+      "Limitation and delay objections if trigger dates are not proved via certified copies."
+    ],
+    evidenceRequirements: [
+      "Sworn Order XIX Rule 3 CPC Affidavit distinguishing personal knowledge vs legal advice.",
+      "Section 63 BSA Certificate (Schedule Part A & B) for emails/WhatsApp/ledgers.",
+      "Paginated List of Dates & Chronology with certified annexures."
+    ],
+    crossExamQuestions: [
+      "Confirm exact dates of written notices and commercial correspondence prior to criminal/litigation escalation.",
+      "Identify the custodian and hash integrity of electronic records relied upon."
+    ],
+    aiGeneratedDisclaimer: "AI-generated strategic analysis. Verify all authorities, factual citations, and procedural strategy independently before court submissions."
+  };
+}
+async function translateLegalContent(input) {
+  const paragraphs = input.sourceText.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean).slice(0, 20);
+  if (getNvidiaConfig().configured) {
+    try {
+      const res = await callNvidiaChat({
+        systemPrompt: buildSupremeCourtSystemPrompt(
+          input.jurisdiction,
+          `You are a certified Indian Legal Translator. Translate accurately from ${input.sourceLanguage} to ${input.targetLanguage}, preserving exact section numbers, case names, monetary figures, dates, and legal terms of art.
+Return ONLY valid JSON:
+{
+  "translatedText": "full translated text",
+  "segments": [{"original": "...", "translated": "..."}],
+  "terminologyNotes": ["key legal term mappings preserved"]
+}`
+        ),
+        userPrompt: `Target Language: ${input.targetLanguage}
+
+Legal Text:
+${input.sourceText.slice(0, 14e3)}`,
+        tier: "expert",
+        jsonMode: true,
+        maxTokens: 2600
+      });
+      const parsed = extractJsonFromText(res.text);
+      return {
+        translatedText: parsed.translatedText || "",
+        segments: Array.isArray(parsed.segments) && parsed.segments.length > 0 ? parsed.segments : paragraphs.map((p) => ({ original: p, translated: parsed.translatedText || p })),
+        terminologyNotes: parsed.terminologyNotes ?? [],
+        qualityWarning: "Machine-assisted legal translation. Advocate verification is required before filing translated annexures in court."
+      };
+    } catch {
+    }
+  }
+  return {
+    translatedText: input.sourceText,
+    segments: paragraphs.map((p) => ({
+      original: p,
+      translated: `[Translation to ${input.targetLanguage} requires live AI translation key \u2014 original text preserved for manual edit]
+${p}`
+    })),
+    terminologyNotes: [
+      "Original statutory numbers, case titles, and monetary amounts preserved without modification."
+    ],
+    qualityWarning: "Translation engine unavailable or unconfigured; side-by-side manual correction mode active. Configure NVIDIA_API_KEY for automated translation."
+  };
+}
+
+// src/server/repository.ts
+import crypto5 from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+
+// src/server/seedData.ts
+import crypto4 from "node:crypto";
+function isoDaysFromNow(offsetDays) {
+  const d = /* @__PURE__ */ new Date();
+  d.setUTCDate(d.getUTCDate() + offsetDays);
+  return d.toISOString().slice(0, 10);
+}
+function buildSeededWorkspace(userId) {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const mLitigationId = crypto4.randomUUID();
+  const mCorpId = crypto4.randomUUID();
+  const mGlobalId = crypto4.randomUUID();
+  const matters = [
+    {
+      id: mLitigationId,
+      userId,
+      title: "State of Maharashtra v. Vikramaditya Kulkarni",
+      matterCode: "BOM-HC-2026-418",
+      clientName: "Vikramaditya Kulkarni (Director, Apex InfraTech)",
+      opposingParty: "State of Maharashtra & EOW Mumbai",
+      jurisdiction: "india_litigation",
+      forum: "High Court of Judicature at Bombay (Criminal Appellate Side)",
+      status: "pending_hearing",
+      summaryFacts: "Anticipatory bail & quashing matter arising out of commercial JV dispute given criminal colour by complainant. FIR registered on 14 Jan 2026 alleging offences of cheating and criminal breach of trust over \u20B94.8 Cr escrow milestone release. Civil arbitration already invoked on 02 Dec 2025 prior to FIR.",
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      id: mCorpId,
+      userId,
+      title: "Project Horizon \u2014 Acquisition & MSA Review (FinGrid Pvt. Ltd.)",
+      matterCode: "MA-DEL-2026-092",
+      clientName: "Kaveri Capital Partners LLP",
+      opposingParty: "FinGrid Payments Technologies Pvt. Ltd.",
+      jurisdiction: "corporate_ma",
+      forum: "Corporate M&A / Commercial Advisory (Mumbai & Bengaluru)",
+      status: "in_review",
+      summaryFacts: "Series B acquisition due diligence and vendor Master Services Agreement redlining for payment gateway infrastructure. Key exposure areas include uncapped IP indemnity, RBI PA/PG compliance warranties, unilateral termination rights, and arbitration seat alignment.",
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      id: mGlobalId,
+      userId,
+      title: "Meridian Renewables Pte. Ltd. v. Helios Grid GmbH",
+      matterCode: "SIAC-ARB-2026-114",
+      clientName: "Meridian Renewables Pte. Ltd. (Singapore)",
+      opposingParty: "Helios Grid GmbH (Munich)",
+      jurisdiction: "global_multi",
+      forum: "Singapore International Arbitration Centre (SIAC) \u2014 English Governing Law",
+      status: "active",
+      summaryFacts: "Cross-border solar turbine EPC delay dispute ($14.2M liquidated damages claim) governed by English law with Singapore seat and anticipated Part II foreign award enforcement against Indian subsidiary assets under Section 48 of the Arbitration & Conciliation Act, 1996.",
+      createdAt: now,
+      updatedAt: now
+    }
+  ];
+  const drafts = [
+    {
+      id: crypto4.randomUUID(),
+      matterId: mLitigationId,
+      userId,
+      title: "Anticipatory Bail Application \u2014 Bombay High Court",
+      docType: "Anticipatory Bail Application",
+      version: 2,
+      updatedAt: now,
+      content: `IN THE HIGH COURT OF JUDICATURE AT BOMBAY
+CRIMINAL APPELLATE JURISDICTION
+ANTICIPATORY BAIL APPLICATION NO. ______ OF 2026
+
+IN THE MATTER OF:
+Vikramaditya Kulkarni, Director, Apex InfraTech Pvt. Ltd. ... Applicant
+VERSUS
+The State of Maharashtra (through EOW, Mumbai) ... Respondent
+
+APPLICATION UNDER SECTION 438 CrPC FOR GRANT OF PRE-ARREST BAIL
+
+MOST RESPECTFULLY SHOWETH:
+
+1. That the Applicant is a law-abiding citizen and Director of Apex InfraTech Pvt. Ltd., having deep roots in society, and is apprehending arrest in FIR No. 41/2026 registered at Marine Drive Police Station (transferred to EOW) for alleged offences punishable under Section 420 IPC, Section 406 IPC, and Section 120B of the Indian Penal Code.
+
+2. That the entire dispute is purely commercial and civil in nature arising out of a Joint Venture Agreement dated 12.03.2024. The Applicant had already issued a Notice Invoking Arbitration on 02.12.2025, nearly six weeks prior to the lodging of the impugned FIR under Section 154 CrPC.
+
+3. That the Applicant has complied with every notice issued under Section 41A CrPC and has handed over complete digital ledger records accompanied by a certificate under Section 65B of the Indian Evidence Act.
+
+4. That custodial interrogation is wholly unnecessary as the prosecution case rests entirely on documentary and banking records already seized. The Applicant relies on the settled law laid down by the Hon'ble Supreme Court in Arnesh Kumar v. State of Bihar and Siddharam Satlingappa Mhetre.
+
+PRAYER
+It is therefore most humbly prayed that this Hon'ble Court may be pleased to direct that in the event of arrest in FIR No. 41/2026, the Applicant be released on bail on such terms and conditions as this Hon'ble Court deems fit.`
+    },
+    {
+      id: crypto4.randomUUID(),
+      matterId: mCorpId,
+      userId,
+      title: "Due Diligence Preliminary Requisition Note",
+      docType: "M&A Requisition Memo",
+      version: 1,
+      updatedAt: now,
+      content: `CONFIDENTIAL \u2014 ATTORNEY-CLIENT PRIVILEGED
+PROJECT HORIZON: PRELIMINARY LEGAL DUE DILIGENCE REQUISITIONS
+
+1. Regulatory Authorizations: Provide copies of RBI Payment Aggregator authorization letters, periodic CERT-In cybersecurity audit certificates (FY 2024-25 & 2025-26), and data localization compliance attestations.
+2. Material Customer Contracts: Disclose all top-10 enterprise MSAs containing uncapped consequential damages, change-of-control termination triggers, or exclusivity covenants.
+3. Pending Litigation & Tax Notices: Provide status of GST show-cause notice dated 18.08.2025 and any labour/ESOP disputes.`
+    }
+  ];
+  const researchMemos = [
+    {
+      id: crypto4.randomUUID(),
+      matterId: mLitigationId,
+      userId,
+      query: "Quashing and anticipatory bail when commercial breach is given criminal colour under BNS 318(4) / IPC 420",
+      jurisdiction: "india_litigation",
+      answerMarkdown: `### Executive Conclusion
+Indian Supreme Court precedent consistently deprecates converting civil or contractual disputes into criminal prosecutions for cheating (**Section 318(4) BNS**, formerly Section 420 IPC) or criminal breach of trust (**Section 316(2) BNS**, formerly Section 406 IPC) unless dishonest intention existed **at the very inception** of the transaction.
+
+### Controlling Precedents
+1. **Lalit Chaturvedi & Ors. v. State of Uttar Pradesh (2024 SCC OnLine SC 171)** \u2014 Mere breach of contract or unpaid commercial dues does not constitute cheating or criminal breach of trust; criminal proceedings cannot be used as a pressure tactic for recovery.
+2. **Delhi Race Club (1940) Ltd. v. State of Uttar Pradesh (2024 INSC 626)** \u2014 Clarified that cheating and criminal breach of trust are antithetical and cannot ordinarily co-exist on the same set of facts without distinct ingredients.
+3. **Arnesh Kumar v. State of Bihar (2014) 8 SCC 273** (now codified in **Section 35(3) BNSS**) \u2014 Mandatory written reasons before arrest for offences punishable up to 7 years.
+
+### Strategic Application to Matter
+- Highlight the **02.12.2025 Arbitration Notice** predating the **14.01.2026 FIR** to establish counter-blast mala fides.
+- Note that under **Section 316(2) BNS**, criminal breach of trust punishment increased from 3 years to 5 years, still squarely within the 7-year threshold attracting Section 35(3) BNSS safeguards.`,
+      citations: [
+        {
+          title: "Delhi Race Club (1940) Ltd. v. State of Uttar Pradesh \u2014 Supreme Court of India (2024)",
+          url: "https://main.sci.gov.in/",
+          courtOrSource: "Supreme Court of India",
+          status: "verified_web"
+        },
+        {
+          title: "Bharatiya Nyaya Sanhita, 2023 \u2014 Sections 316 & 318",
+          url: "https://www.indiacode.nic.in/",
+          courtOrSource: "India Code (Central Act)",
+          status: "statute"
+        }
+      ],
+      citationIntegrity: {
+        verifiedSourceCount: 2,
+        jurisdictionChecked: "Indian Criminal & Supreme Court Jurisprudence",
+        bnsComplianceNote: "Cross-verified against BNS 2023 & BNSS 2023 equivalents.",
+        confidenceLabel: "Grounded via Web & Statute"
+      },
+      createdAt: now
+    }
+  ];
+  const vaultDocuments = [
+    {
+      id: crypto4.randomUUID(),
+      matterId: mLitigationId,
+      userId,
+      fileName: "FIR_41_2026_MarineDrive_OCR.pdf",
+      mimeType: "application/pdf",
+      docCategory: "FIR / Police Record",
+      extractedText: "First Information Report No. 41/2026 dated 14.01.2026. Informant alleges \u20B94.80 Cr paid in March 2024 towards JV project in Thane was diverted. Informant claims no prior dispute existed before January 2026.",
+      translatedText: "\u092A\u094D\u0930\u0925\u092E \u0938\u0942\u091A\u0928\u093E \u0930\u093F\u092A\u094B\u0930\u094D\u091F \u0938\u0902\u0916\u094D\u092F\u093E 41/2026 \u0926\u093F\u0928\u093E\u0902\u0915 14.01.2026\u0964 \u0936\u093F\u0915\u093E\u092F\u0924\u0915\u0930\u094D\u0924\u093E \u0915\u093E \u0906\u0930\u094B\u092A \u0939\u0948 \u0915\u093F \u0920\u093E\u0923\u0947 \u092E\u0947\u0902 \u0938\u0902\u092F\u0941\u0915\u094D\u0924 \u0909\u0926\u094D\u092F\u092E \u092A\u0930\u093F\u092F\u094B\u091C\u0928\u093E \u0915\u0947 \u0932\u093F\u090F \u092E\u093E\u0930\u094D\u091A 2024 \u092E\u0947\u0902 \u092D\u0941\u0917\u0924\u093E\u0928 \u0915\u093F\u090F \u0917\u090F \u20B94.80 \u0915\u0930\u094B\u0921\u093C \u0915\u0940 \u0930\u093E\u0936\u093F \u0915\u093E \u0926\u0941\u0930\u0941\u092A\u092F\u094B\u0917 \u0915\u093F\u092F\u093E \u0917\u092F\u093E\u0964",
+      targetLanguage: "Hindi",
+      chronology: [
+        {
+          date: "2024-03-12",
+          event: "Execution of Joint Venture Agreement between Apex InfraTech and Complainant",
+          sourceDoc: "JV_Agreement_2024.pdf",
+          significance: "Establishes commercial arbitration clause (Clause 19.2) and milestone escrow."
+        },
+        {
+          date: "2025-12-02",
+          event: "Applicant served Section 21 Notice Invoking Arbitration demanding reconciliation",
+          sourceDoc: "Sec21_Notice_Dec2025.pdf",
+          significance: "Proves prior civil dispute six weeks before criminal complaint."
+        },
+        {
+          date: "2026-01-14",
+          event: "FIR No. 41/2026 lodged at Marine Drive PS alleging cheating & breach of trust",
+          sourceDoc: "FIR_41_2026_MarineDrive_OCR.pdf",
+          significance: "Trigger date for pre-arrest bail and Section 528 BNSS quashing petition."
+        }
+      ],
+      contradictions: [
+        {
+          topic: "Existence of Prior Commercial Dispute",
+          statementA: 'FIR Para 6 states: "No written dispute or notice was exchanged prior to January 2026."',
+          statementB: "Speed Post tracking & Email Annexure C confirm receipt of Applicant\u2019s Arbitration Notice on 03.12.2025.",
+          severity: "high",
+          recommendation: "Highlight material suppression of facts under Bhajan Lal guidelines to seek interim protection and quashing."
+        }
+      ],
+      createdAt: now
+    }
+  ];
+  const contractReviews = [
+    {
+      id: crypto4.randomUUID(),
+      matterId: mCorpId,
+      userId,
+      title: "FinGrid Enterprise Master Services Agreement (v3.2 Vendor Draft)",
+      playbook: "Indian Corporate & Arbitration Act Playbook",
+      sourceText: `CLAUSE 8.2 INDEMNIFICATION: Customer shall indemnify, defend, and hold harmless Vendor against any and all third-party claims, direct, indirect, incidental, or consequential losses arising out of Customer's use of the Platform without any monetary cap.
+CLAUSE 11.1 TERMINATION FOR CONVENIENCE: Vendor may terminate this Agreement at any time upon 7 days written notice without refund of prepaid annual fees.
+CLAUSE 14.3 GOVERNING LAW & DISPUTE RESOLUTION: This Agreement shall be governed by the laws of India. Any dispute shall be resolved by a sole arbitrator appointed exclusively by Vendor's Managing Director, with seat in Delhi.`,
+      summary: "High commercial risk profile: Vendor draft imposes asymmetric uncapped liability on Customer, allows unilateral forfeiture of prepaid fees on 7-day termination, and includes a legally unenforceable unilateral arbitrator appointment clause under Perkins Eastman Architects v. HSCC (India) Ltd.",
+      clauses: [
+        {
+          id: "cl_indemnity_8_2",
+          clauseRef: "Clause 8.2",
+          title: "Uncapped Asymmetric Indemnification",
+          severity: "high",
+          issueSummary: "Imposes uncapped indemnification including indirect and consequential damages on Customer.",
+          originalText: "Customer shall indemnify, defend, and hold harmless Vendor against any and all third-party claims, direct, indirect, incidental, or consequential losses arising out of Customer's use of the Platform without any monetary cap.",
+          proposedText: "Each Party shall indemnify the other solely for direct, finally awarded third-party damages arising from gross negligence, willful misconduct, or third-party IP infringement, excluding indirect or consequential losses, and capped at 100% of fees paid in the preceding twelve (12) months.",
+          legalRationale: "Under Section 73 of the Indian Contract Act, 1872, remote or indirect damages are generally excluded unless explicitly assumed; uncapped consequential indemnity creates uninsurable M&A balance-sheet exposure.",
+          decision: "pending"
+        },
+        {
+          id: "cl_arb_14_3",
+          clauseRef: "Clause 14.3",
+          title: "Invalid Unilateral Arbitrator Appointment",
+          severity: "high",
+          issueSummary: "Sole arbitrator appointed solely by Vendor's Managing Director is void under Section 12(5) Arbitration Act.",
+          originalText: "Any dispute shall be resolved by a sole arbitrator appointed exclusively by Vendor's Managing Director, with seat in Delhi.",
+          proposedText: "Any dispute shall be finally resolved by arbitration under the Arbitration and Conciliation Act, 1996 before a sole arbitrator mutually appointed by both Parties (or failing agreement within 30 days, by the Mumbai Centre for International Arbitration), with seat and venue in Mumbai.",
+          legalRationale: "Unilateral appointment by an interested party violates Section 12(5) read with Seventh Schedule (Perkins Eastman Architects DPC v. HSCC (India) Ltd., 2019; Central Organisation for Railway Electrification, 2024 Constitution Bench).",
+          decision: "pending"
+        },
+        {
+          id: "cl_term_11_1",
+          clauseRef: "Clause 11.1",
+          title: "Unilateral 7-Day Termination Without Pro-Rata Refund",
+          severity: "medium",
+          issueSummary: "Allows Vendor to terminate for convenience on 7 days notice while retaining prepaid annual fees.",
+          originalText: "Vendor may terminate this Agreement at any time upon 7 days written notice without refund of prepaid annual fees.",
+          proposedText: "Either Party may terminate for convenience upon ninety (90) days prior written notice; if Vendor terminates without cause, Vendor shall refund all prepaid, unearned fees on a pro-rata basis within fifteen (15) business days and provide transition assistance.",
+          legalRationale: "For critical payment gateway infrastructure, 7 days notice causes operational disruption and unfair forfeiture of consideration.",
+          decision: "pending"
+        }
+      ],
+      requisitions: [
+        "Obtain FinGrid Board Resolution & RBI Payment Aggregator authorization certificate.",
+        "Confirm whether existing customer MSAs contain unilateral arbitration clauses requiring amendment prior to closing.",
+        "Verify cyber insurance policy limit (minimum \u20B925 Cr recommended to backstop Vendor IP & data breach indemnity)."
+      ],
+      createdAt: now
+    }
+  ];
+  const courtroomSessions = [
+    {
+      id: crypto4.randomUUID(),
+      matterId: mLitigationId,
+      userId,
+      mode: "bench",
+      forumContext: "Bombay High Court \u2014 Single Judge Criminal Bail Bench",
+      briefExcerpt: "Anticipatory Bail in FIR No. 41/2026 alleging cheating & criminal breach of trust over \u20B94.8 Cr JV escrow.",
+      vulnerabilities: [
+        "Bench may ask why the Applicant did not deposit a security bond or escrow statement showing utilization of the \u20B94.8 Cr.",
+        "Ensure exact distinction between Section 318(4) BNS and Section 316(2) BNS per Delhi Race Club (2024) is framed succinctly."
+      ],
+      turns: [
+        {
+          id: crypto4.randomUUID(),
+          speaker: "bench",
+          message: "Counsel, the EOW remand note claims \u20B94.80 Crore was transferred to a sister entity within 48 hours of milestone release. Why shouldn\u2019t custodial interrogation be permitted to trace the money trail?",
+          weaknessFlag: "Money-trail tracing argument is the prosecution\u2019s strongest point against pre-arrest bail.",
+          suggestedRebuttal: "My Lord, every single rupee moved strictly through RTGS banking channels to the designated EPC subcontractor named in Schedule III of the JV Agreement. Complete audited bank statements and BSA Section 63 certificates are already tendered to the IO on 22.01.2026; nothing remains to be discovered through custody.",
+          authorities: [
+            "Lalit Chaturvedi v. State of U.P. (2024 SCC OnLine SC 171)",
+            "Arnesh Kumar v. State of Bihar (2014) 8 SCC 273 / Sec. 35(3) BNSS"
+          ],
+          timestamp: now
+        }
+      ],
+      createdAt: now
+    }
+  ];
+  const trackedCases = [
+    {
+      id: crypto4.randomUUID(),
+      matterId: mLitigationId,
+      userId,
+      caseNumber: "ABA/418/2026",
+      cnrNumber: "MHHC010094822026",
+      court: "Bombay High Court",
+      courtroom: "Court Room 34",
+      bench: "Hon\u2019ble Justice R. K. Deshmukh",
+      causeListItem: "Sr. No. 18 (Urgent Admission)",
+      nextHearingDate: isoDaysFromNow(2),
+      stage: "Interim Protection & IO Reply",
+      status: "listed",
+      notes: "Keep Section 21 Arbitration Notice speed-post receipt and BNS/BNSS citation chart ready.",
+      createdAt: now
+    },
+    {
+      id: crypto4.randomUUID(),
+      matterId: mGlobalId,
+      userId,
+      caseNumber: "ARB/114/2026/SIAC",
+      cnrNumber: "SIAC-2026-114-SG",
+      court: "SIAC Tribunal (Singapore)",
+      courtroom: "Maxwell Chambers Suite 4",
+      bench: "Presiding Arbitrator M. Tan SC",
+      causeListItem: "Procedural Hearing #2",
+      nextHearingDate: isoDaysFromNow(9),
+      stage: "Document Production & Redfern Schedule",
+      status: "listed",
+      notes: "Exchange Redfern Schedule objections 72 hours prior to procedural hearing.",
+      createdAt: now
+    },
+    {
+      id: crypto4.randomUUID(),
+      matterId: mCorpId,
+      userId,
+      caseNumber: "CP(IB)/209/MB/2026",
+      cnrNumber: "NCLTMUM002092026",
+      court: "NCLT Mumbai Bench",
+      courtroom: "Court II",
+      bench: "Hon\u2019ble Member (J) S. Verma",
+      causeListItem: "Sr. No. 42 (Ordinary List)",
+      nextHearingDate: isoDaysFromNow(14),
+      stage: "Scheme Merger Compliance Check",
+      status: "in_session",
+      notes: "Track creditor NOC affidavit filing status before closing.",
+      createdAt: now
+    }
+  ];
+  const deadlines = [
+    {
+      id: crypto4.randomUUID(),
+      matterId: mLitigationId,
+      userId,
+      title: "File Rejoinder Affidavit & BSA Sec. 63 Certificate",
+      statuteArticle: "Bombay HC Criminal Appellate Rules",
+      triggerDate: isoDaysFromNow(-7),
+      dueDate: isoDaysFromNow(1),
+      completed: false,
+      notes: "Serve advance copy on APP office before 4:00 PM.",
+      createdAt: now
+    },
+    {
+      id: crypto4.randomUUID(),
+      matterId: mGlobalId,
+      userId,
+      title: "Potential Section 34 Award Challenge Outer Window",
+      statuteArticle: "Arbitration & Conciliation Act, Sec. 34(3)",
+      triggerDate: isoDaysFromNow(-45),
+      dueDate: isoDaysFromNow(45),
+      graceDate: isoDaysFromNow(75),
+      completed: false,
+      notes: "Strict 3 months + 30 days non-extendable statutory window.",
+      createdAt: now
+    }
+  ];
+  const meetingBriefs = [
+    {
+      id: crypto4.randomUUID(),
+      matterId: mLitigationId,
+      userId,
+      title: "Client Consultation \u2014 Vikramaditya Kulkarni (Pre-Hearing Strategy)",
+      durationLabel: "18:42",
+      transcript: "Client confirmed all \u20B94.8 Cr transfers went to certified EPC subcontractors via RTGS. Client also located the signed WhatsApp confirmation from complainant acknowledging project delay due to municipal clearance.",
+      summary: "Pre-hearing consultation confirming complete banking trail for escrow utilization and newly surfaced electronic admissions from the complainant negating dishonest intent at inception.",
+      keyFacts: [
+        "All \u20B94.8 Cr milestone disbursements cleared via RTGS to approved EPC subcontractors.",
+        "Complainant acknowledged municipal clearance delay via WhatsApp on 11.10.2025.",
+        "Applicant appeared before EOW on 19.01.2026 and 28.01.2026 pursuant to notice."
+      ],
+      actionItems: [
+        "Prepare Section 63 BSA electronic evidence certificate (with forensic expert co-signature) for WhatsApp admissions.",
+        "Attach audited RTGS ledger extract as Annexure D to the Rejoinder Affidavit."
+      ],
+      statutoryIssues: [
+        "Section 63 Bharatiya Sakshya Adhiniyam, 2023 (Electronic Record Certificate)",
+        "Section 318(4) BNS vs civil breach of contract threshold"
+      ],
+      createdAt: now
+    }
+  ];
+  const whatsappMessages = [
+    {
+      id: crypto4.randomUUID(),
+      matterId: mLitigationId,
+      userId,
+      sender: "assistant",
+      body: "VidhiOS Command Center synced. Type /hearings, /bns 420, /cases, /deadlines, /remind <task>, or /brief to manage your chambers directly.",
+      commandTag: "system",
+      createdAt: now
+    }
+  ];
+  return {
+    matters,
+    researchMemos,
+    drafts,
+    vaultDocuments,
+    contractReviews,
+    courtroomSessions,
+    trackedCases,
+    deadlines,
+    meetingBriefs,
+    whatsappMessages
+  };
+}
+
+// src/server/repository.ts
+var DATA_DIR = path.resolve(process.cwd(), "data");
+var STORE_PATH = path.join(DATA_DIR, "vidhios-store.json");
+var TIER_LIMITS = {
+  FREE: { aiQueriesLimit: 40, storageLimitMb: 100, maxMatters: 5, maxSeats: 1 },
+  PRO: { aiQueriesLimit: 500, storageLimitMb: 2048, maxMatters: 100, maxSeats: 5 },
+  CHAMBERS: { aiQueriesLimit: 2500, storageLimitMb: 10240, maxMatters: 500, maxSeats: 25 },
+  ENTERPRISE: { aiQueriesLimit: 25e3, storageLimitMb: 102400, maxMatters: 1e4, maxSeats: 500 }
+};
+var EMPTY_STATE = {
+  organizations: [],
+  organizationMembers: [],
+  users: [],
+  clients: [],
+  matters: [],
+  tasks: [],
+  hearings: [],
+  researchMemos: [],
+  drafts: [],
+  vaultDocuments: [],
+  contractReviews: [],
+  courtroomSessions: [],
+  trackedCases: [],
+  deadlines: [],
+  meetingBriefs: [],
+  whatsappMessages: [],
+  assistantMessages: [],
+  notifications: [],
+  activityLogs: [],
+  auditEvents: [],
+  subscriptions: [],
+  workflowRuns: [],
+  corporateProfiles: [],
+  evidenceItems: [],
+  litigationStrategies: [],
+  revokedTokens: []
+};
+function makeSlug(name) {
+  const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
+  return `${base || "chambers"}-${crypto5.randomBytes(3).toString("hex")}`;
+}
+var WorkspaceRepository = class {
+  constructor() {
+    this.writeQueue = Promise.resolve();
+    this.readyPromise = null;
+    this.lastPersistError = null;
+    this.state = this.loadState();
+    if (isNeonConfigured()) {
+      this.engine = "neon";
+      this.readyPromise = this.initNeonAsync();
+    } else if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      this.engine = "supabase";
+      this.readyPromise = Promise.resolve();
+      this.ensureDemoAccount();
+      this.ensureDefaultAdminAccount();
+      this.backfillTenancyAndSubscriptions();
+    } else {
+      this.engine = "local_durable";
+      this.readyPromise = Promise.resolve();
+      this.ensureDemoAccount();
+      this.ensureDefaultAdminAccount();
+      this.backfillTenancyAndSubscriptions();
+    }
+  }
+  async ensureReady(forceReload = false) {
+    if (this.readyPromise) {
+      await this.readyPromise;
+    }
+    if (this.engine === "neon" && forceReload) {
+      const remote = await loadStoreFromNeon();
+      if (remote && remote.users.length > 0) {
+        this.state = remote;
+        for (const rt of remote.revokedTokens) {
+          revokeSessionTokenId(rt.jti, rt.expiresAt);
+        }
+        this.ensureDemoAccount();
+        this.ensureDefaultAdminAccount();
+        this.backfillTenancyAndSubscriptions();
+      }
+    }
+  }
+  async initNeonAsync() {
+    try {
+      await initNeonSchema();
+      const remoteState = await loadStoreFromNeon();
+      if (remoteState && remoteState.users.length > 0) {
+        this.state = remoteState;
+        for (const rt of remoteState.revokedTokens) {
+          revokeSessionTokenId(rt.jti, rt.expiresAt);
+        }
+        this.ensureDemoAccount();
+        this.ensureDefaultAdminAccount();
+        this.backfillTenancyAndSubscriptions();
+        await persistStoreToNeon(this.state);
+        console.log("[Neon] Repository synchronized with remote Neon PostgreSQL.");
+      } else {
+        this.ensureDemoAccount();
+        this.ensureDefaultAdminAccount();
+        this.backfillTenancyAndSubscriptions();
+        await persistStoreToNeon(this.state);
+        console.log("[Neon] Initialized remote Neon PostgreSQL with chamber records.");
+      }
+    } catch (err) {
+      this.lastPersistError = err instanceof Error ? err.message : "Neon initialization failed";
+      console.error("[Neon] Initialization error:", err);
+    }
+  }
+  loadState() {
+    try {
+      if (fs.existsSync(STORE_PATH)) {
+        const raw = fs.readFileSync(STORE_PATH, "utf8");
+        const parsed = JSON.parse(raw);
+        return {
+          ...structuredClone(EMPTY_STATE),
+          ...parsed
+        };
+      }
+    } catch (err) {
+      console.error("Failed to read local durable store; initializing clean state:", err);
+    }
+    return structuredClone(EMPTY_STATE);
+  }
+  /**
+   * Persists state durably. In Neon mode, Neon errors are NOT swallowed silently.
+   */
+  async persist() {
+    const snapshot = JSON.stringify(this.state, null, 2);
+    const task = this.writeQueue.then(async () => {
+      if (this.engine === "neon") {
+        try {
+          await persistStoreToNeon(this.state);
+          this.lastPersistError = null;
+        } catch (err) {
+          this.lastPersistError = err instanceof Error ? err.message : "Neon persistence failed";
+          throw err;
+        }
+        return;
+      }
+      await fs.promises.mkdir(DATA_DIR, { recursive: true });
+      const tmpPath = `${STORE_PATH}.${crypto5.randomBytes(6).toString("hex")}.tmp`;
+      await fs.promises.writeFile(tmpPath, snapshot, "utf8");
+      await fs.promises.rename(tmpPath, STORE_PATH);
+      this.lastPersistError = null;
+    });
+    this.writeQueue = task.catch(() => {
+    });
+    await task;
+  }
+  toPublicUser(u) {
+    const { passwordHash: _ignored, ...profile } = u;
+    return profile;
+  }
+  createOrganizationForUser(user, orgName, tier = "PRO", orgRole = "owner") {
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const org = {
+      id: crypto5.randomUUID(),
+      name: orgName || `${user.fullName} Chambers`,
+      slug: makeSlug(orgName || user.fullName),
+      tier,
+      createdAt: now
+    };
+    this.state.organizations.push(org);
+    user.organizationId = org.id;
+    user.organization = org.name;
+    user.orgRole = orgRole;
+    this.state.organizationMembers.push({
+      id: crypto5.randomUUID(),
+      organizationId: org.id,
+      userId: user.id,
+      role: orgRole,
+      permissions: orgRole === "client" ? ["matters:read", "documents:read"] : ["matters:all", "drafts:all", "research:all", "vault:all", "team:manage"],
+      createdAt: now
+    });
+    const limits = TIER_LIMITS[tier];
+    this.state.subscriptions.push({
+      id: crypto5.randomUUID(),
+      organizationId: org.id,
+      tier,
+      status: "active",
+      aiQueriesLimit: limits.aiQueriesLimit,
+      aiQueriesUsed: 0,
+      aiTokensUsed: 0,
+      storageLimitMb: limits.storageLimitMb,
+      storageUsedMb: 0,
+      maxMatters: limits.maxMatters,
+      maxSeats: limits.maxSeats,
+      expiresAt: new Date(Date.now() + 365 * 864e5).toISOString(),
+      updatedAt: now
+    });
+    return org;
+  }
+  backfillTenancyAndSubscriptions() {
+    for (const user of this.state.users) {
+      if (!user.organizationId || !this.state.organizations.some((o) => o.id === user.organizationId)) {
+        const existingByName = user.organization ? this.state.organizations.find((o) => o.name === user.organization) : void 0;
+        if (existingByName) {
+          user.organizationId = existingByName.id;
+          user.orgRole = user.orgRole || "advocate";
+          if (!this.state.organizationMembers.some(
+            (m) => m.organizationId === existingByName.id && m.userId === user.id
+          )) {
+            this.state.organizationMembers.push({
+              id: crypto5.randomUUID(),
+              organizationId: existingByName.id,
+              userId: user.id,
+              role: user.orgRole,
+              permissions: ["matters:all", "drafts:all", "research:all", "vault:all"],
+              createdAt: (/* @__PURE__ */ new Date()).toISOString()
+            });
+          }
+        } else {
+          this.createOrganizationForUser(
+            user,
+            user.organization || `${user.fullName} Chambers`,
+            user.email === "chambers@vidhios.in" ? "CHAMBERS" : "PRO",
+            "owner"
+          );
+        }
+      }
+      if (!this.state.subscriptions.some((s) => s.organizationId === user.organizationId)) {
+        const limits = TIER_LIMITS.PRO;
+        this.state.subscriptions.push({
+          id: crypto5.randomUUID(),
+          organizationId: user.organizationId,
+          tier: "PRO",
+          status: "active",
+          aiQueriesLimit: limits.aiQueriesLimit,
+          aiQueriesUsed: 0,
+          aiTokensUsed: 0,
+          storageLimitMb: limits.storageLimitMb,
+          storageUsedMb: 0,
+          maxMatters: limits.maxMatters,
+          maxSeats: limits.maxSeats,
+          expiresAt: new Date(Date.now() + 365 * 864e5).toISOString(),
+          updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    }
+    const userOrgMap = new Map(this.state.users.map((u) => [u.id, u.organizationId || ""]));
+    for (const m of this.state.matters) {
+      if (!m.organizationId) {
+        m.organizationId = userOrgMap.get(m.userId) || "";
+      }
+    }
+    for (const r of this.state.researchMemos) {
+      if (!r.organizationId) r.organizationId = userOrgMap.get(r.userId) || "";
+    }
+    for (const d of this.state.drafts) {
+      if (!d.organizationId) d.organizationId = userOrgMap.get(d.userId) || "";
+    }
+    for (const v of this.state.vaultDocuments) {
+      if (!v.organizationId) v.organizationId = userOrgMap.get(v.userId) || "";
+      if (!v.processingStatus) v.processingStatus = "completed";
+    }
+    for (const c of this.state.contractReviews) {
+      if (!c.organizationId) c.organizationId = userOrgMap.get(c.userId) || "";
+    }
+  }
+  seedForUser(userId, organizationId) {
+    const seeded = buildSeededWorkspace(userId);
+    const orgId = organizationId || "";
+    for (const m of seeded.matters) {
+      m.organizationId = orgId;
+      m.assignedUserIds = [userId];
+    }
+    for (const r of seeded.researchMemos) r.organizationId = orgId;
+    for (const d of seeded.drafts) {
+      d.organizationId = orgId;
+      d.status = "draft";
+      d.versions = [
+        {
+          version: d.version,
+          title: d.title,
+          content: d.content,
+          savedAt: d.updatedAt,
+          savedBy: "System Seed"
+        }
+      ];
+    }
+    for (const v of seeded.vaultDocuments) {
+      v.organizationId = orgId;
+      v.processingStatus = "completed";
+    }
+    for (const c of seeded.contractReviews) c.organizationId = orgId;
+    this.state.matters.push(...seeded.matters);
+    this.state.researchMemos.push(...seeded.researchMemos);
+    this.state.drafts.push(...seeded.drafts);
+    this.state.vaultDocuments.push(...seeded.vaultDocuments);
+    this.state.contractReviews.push(...seeded.contractReviews);
+    this.state.courtroomSessions.push(...seeded.courtroomSessions);
+    this.state.trackedCases.push(...seeded.trackedCases);
+    this.state.deadlines.push(...seeded.deadlines);
+    this.state.meetingBriefs.push(...seeded.meetingBriefs);
+    this.state.whatsappMessages.push(...seeded.whatsappMessages);
+    if (seeded.matters[0] && orgId) {
+      const m0 = seeded.matters[0];
+      this.state.clients.push({
+        id: crypto5.randomUUID(),
+        organizationId: orgId,
+        userId,
+        name: m0.clientName,
+        email: "vikram@apexinfratech.in",
+        phone: "+91 98201 44120",
+        company: "Apex InfraTech Pvt. Ltd.",
+        address: "Nariman Point, Mumbai 400021",
+        notes: "Primary litigation client for Bombay High Court anticipatory bail & arbitration.",
+        portalAccessEnabled: false,
+        createdAt: (/* @__PURE__ */ new Date()).toISOString()
+      });
+      this.state.tasks.push({
+        id: crypto5.randomUUID(),
+        organizationId: orgId,
+        matterId: m0.id,
+        userId,
+        assignedToUserId: userId,
+        assignedToName: "Lead Counsel",
+        title: "Finalize Section 63 BSA Hash Certificate & Annexure Index",
+        priority: "high",
+        status: "in_progress",
+        dueDate: new Date(Date.now() + 2 * 864e5).toISOString().slice(0, 10),
+        createdAt: (/* @__PURE__ */ new Date()).toISOString()
+      });
+      this.state.notifications.push({
+        id: crypto5.randomUUID(),
+        organizationId: orgId,
+        userId,
+        title: "Upcoming Hearing Reminder",
+        message: `${m0.matterCode} (${m0.title}) has upcoming High Court listing.`,
+        kind: "hearing",
+        read: false,
+        linkSection: "cases",
+        createdAt: (/* @__PURE__ */ new Date()).toISOString()
+      });
+    }
+  }
+  ensureDemoAccount() {
+    const demoEmail = "chambers@vidhios.in";
+    const existing = this.state.users.find((u) => u.email === demoEmail);
+    if (existing) {
+      if (existing.isAdmin) {
+        existing.isAdmin = false;
+      }
+      if (!existing.organizationId) {
+        this.createOrganizationForUser(
+          existing,
+          existing.organization || "Deshmukh & Associates Chambers",
+          "CHAMBERS",
+          "owner"
+        );
+      }
+      return existing;
+    }
+    const demoUser = {
+      id: crypto5.randomUUID(),
+      email: demoEmail,
+      fullName: "Adv. Meera Deshmukh",
+      role: "Managing Partner",
+      organization: "Deshmukh & Associates Chambers",
+      orgRole: "owner",
+      defaultJurisdiction: "india_litigation",
+      isAdmin: false,
+      passwordHash: hashPassword(crypto5.randomBytes(24).toString("hex")),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.createOrganizationForUser(demoUser, demoUser.organization, "CHAMBERS", "owner");
+    this.state.users.push(demoUser);
+    this.seedForUser(demoUser.id, demoUser.organizationId);
+    return demoUser;
+  }
+  ensureDefaultAdminAccount() {
+    const adminEmail = "vidhios@admin.com";
+    const existing = this.state.users.find((u) => u.email === adminEmail);
+    if (existing) {
+      if (!existing.isAdmin) existing.isAdmin = true;
+      if (!existing.organizationId) {
+        this.createOrganizationForUser(
+          existing,
+          existing.organization || "VidhiOS Judiciary Chambers",
+          "ENTERPRISE",
+          "admin"
+        );
+      }
+      return existing;
+    }
+    const bootstrapPw = (process.env.ADMIN_BOOTSTRAP_PASSWORD || "").trim();
+    if (process.env.NODE_ENV === "production" && !bootstrapPw) {
+      console.warn(
+        "[VidhiOS Security] ADMIN_BOOTSTRAP_PASSWORD not set; skipping automatic creation of default admin user in production."
+      );
+      return null;
+    }
+    const initialPassword = bootstrapPw || "Vidhios@2026";
+    const adminUser = {
+      id: crypto5.randomUUID(),
+      email: adminEmail,
+      fullName: "VidhiOS Administrator",
+      role: "Principal Legal Administrator",
+      organization: "VidhiOS Judiciary Chambers",
+      orgRole: "admin",
+      defaultJurisdiction: "india_litigation",
+      isAdmin: true,
+      passwordHash: hashPassword(initialPassword),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.createOrganizationForUser(adminUser, adminUser.organization, "ENTERPRISE", "admin");
+    this.state.users.push(adminUser);
+    this.seedForUser(adminUser.id, adminUser.organizationId);
+    return adminUser;
+  }
+  getDemoUser() {
+    return this.toPublicUser(this.ensureDemoAccount());
+  }
+  async registerUser(input) {
+    await this.ensureReady();
+    const normalizedEmail = input.email.trim().toLowerCase();
+    if (this.state.users.some((u) => u.email === normalizedEmail)) {
+      throw new Error("An account with this email already exists.");
+    }
+    const user = {
+      id: crypto5.randomUUID(),
+      email: normalizedEmail,
+      fullName: input.fullName.trim(),
+      role: input.role?.trim() || "Advocate",
+      organization: input.organization?.trim() || "Independent Chambers",
+      orgRole: "owner",
+      defaultJurisdiction: input.defaultJurisdiction ?? "india_litigation",
+      isAdmin: false,
+      passwordHash: hashPassword(input.password),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.createOrganizationForUser(user, user.organization, "FREE", "owner");
+    this.state.users.push(user);
+    this.seedForUser(user.id, user.organizationId);
+    await this.persist();
+    return this.toPublicUser(user);
+  }
+  async authenticateUser(email, password) {
+    await this.ensureReady();
+    const normalizedEmail = email.trim().toLowerCase();
+    let user = this.state.users.find((u) => u.email === normalizedEmail);
+    if (!user && this.engine === "neon") {
+      await this.ensureReady(true);
+      user = this.state.users.find((u) => u.email === normalizedEmail);
+    }
+    if (!user) return null;
+    if (!verifyPassword(password, user.passwordHash)) return null;
+    return this.toPublicUser(user);
+  }
+  async revokeToken(jti, expiresAt) {
+    revokeSessionTokenId(jti, expiresAt);
+    if (!this.state.revokedTokens.some((t) => t.jti === jti)) {
+      this.state.revokedTokens.push({ jti, expiresAt });
+    }
+    const now = Date.now();
+    this.state.revokedTokens = this.state.revokedTokens.filter((t) => t.expiresAt > now);
+    await this.persist();
+  }
+  async getUserById(userId) {
+    await this.ensureReady();
+    let user = this.state.users.find((u) => u.id === userId);
+    if (!user && this.engine === "neon") {
+      await this.ensureReady(true);
+      user = this.state.users.find((u) => u.id === userId);
+    }
+    return user ? this.toPublicUser(user) : null;
+  }
+  getAllUsers(scopeOrgId) {
+    const list = scopeOrgId ? this.state.users.filter((u) => u.organizationId === scopeOrgId) : this.state.users;
+    return list.map((u) => ({
+      ...this.toPublicUser(u),
+      mattersCount: this.state.matters.filter((m) => m.userId === u.id).length,
+      draftsCount: this.state.drafts.filter((d) => d.userId === u.id).length,
+      vaultCount: this.state.vaultDocuments.filter((v) => v.userId === u.id).length
+    }));
+  }
+  getAllOrganizations() {
+    return this.state.organizations.map((org) => ({
+      ...org,
+      membersCount: this.state.organizationMembers.filter((m) => m.organizationId === org.id).length,
+      subscription: this.state.subscriptions.find((s) => s.organizationId === org.id)
+    }));
+  }
+  async adminCreateUser(input) {
+    await this.ensureReady();
+    const normalizedEmail = input.email.trim().toLowerCase();
+    if (this.state.users.some((u) => u.email === normalizedEmail)) {
+      throw new Error("An account with this email already exists.");
+    }
+    const orgRole = input.orgRole ?? (input.isAdmin ? "admin" : "advocate");
+    const user = {
+      id: crypto5.randomUUID(),
+      email: normalizedEmail,
+      fullName: input.fullName.trim(),
+      role: input.role?.trim() || "Advocate",
+      organization: input.organization?.trim() || "Independent Chambers",
+      orgRole,
+      defaultJurisdiction: input.defaultJurisdiction ?? "india_litigation",
+      isAdmin: Boolean(input.isAdmin),
+      passwordHash: hashPassword(input.password),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    const targetOrg = input.organizationId ? this.state.organizations.find((o) => o.id === input.organizationId) : void 0;
+    if (targetOrg) {
+      user.organizationId = targetOrg.id;
+      user.organization = targetOrg.name;
+      this.state.organizationMembers.push({
+        id: crypto5.randomUUID(),
+        organizationId: targetOrg.id,
+        userId: user.id,
+        role: orgRole,
+        permissions: orgRole === "client" ? ["matters:read", "documents:read"] : ["matters:all", "drafts:all", "research:all", "vault:all"],
+        createdAt: (/* @__PURE__ */ new Date()).toISOString()
+      });
+    } else {
+      this.createOrganizationForUser(user, user.organization, "PRO", orgRole);
+    }
+    this.state.users.push(user);
+    await this.persist();
+    return this.toPublicUser(user);
+  }
+  async adminUpdateUser(userId, input) {
+    await this.ensureReady();
+    const user = this.state.users.find((u) => u.id === userId);
+    if (!user) throw new Error("User not found.");
+    if (input.fullName !== void 0) user.fullName = input.fullName.trim();
+    if (input.organization !== void 0) user.organization = input.organization.trim();
+    if (input.role !== void 0) user.role = input.role.trim();
+    if (input.orgRole !== void 0) user.orgRole = input.orgRole;
+    if (input.defaultJurisdiction !== void 0) user.defaultJurisdiction = input.defaultJurisdiction;
+    if (input.isAdmin !== void 0) user.isAdmin = Boolean(input.isAdmin);
+    await this.persist();
+    return this.toPublicUser(user);
+  }
+  async adminResetPassword(userId, newPassword) {
+    await this.ensureReady();
+    const user = this.state.users.find((u) => u.id === userId);
+    if (!user) throw new Error("User not found.");
+    if (!newPassword || newPassword.length < 8) {
+      throw new Error("Password must be at least 8 characters.");
+    }
+    user.passwordHash = hashPassword(newPassword);
+    await this.persist();
+  }
+  async adminDeleteUser(userId) {
+    await this.ensureReady();
+    const index = this.state.users.findIndex((u) => u.id === userId);
+    if (index === -1) throw new Error("User not found.");
+    this.state.users.splice(index, 1);
+    this.state.organizationMembers = this.state.organizationMembers.filter((m) => m.userId !== userId);
+    this.state.matters = this.state.matters.filter((m) => m.userId !== userId);
+    this.state.researchMemos = this.state.researchMemos.filter((r) => r.userId !== userId);
+    this.state.drafts = this.state.drafts.filter((d) => d.userId !== userId);
+    this.state.vaultDocuments = this.state.vaultDocuments.filter((v) => v.userId !== userId);
+    this.state.contractReviews = this.state.contractReviews.filter((c) => c.userId !== userId);
+    this.state.courtroomSessions = this.state.courtroomSessions.filter((s) => s.userId !== userId);
+    this.state.trackedCases = this.state.trackedCases.filter((t) => t.userId !== userId);
+    this.state.deadlines = this.state.deadlines.filter((d) => d.userId !== userId);
+    this.state.meetingBriefs = this.state.meetingBriefs.filter((mb) => mb.userId !== userId);
+    this.state.whatsappMessages = this.state.whatsappMessages.filter((w) => w.userId !== userId);
+    this.state.assistantMessages = this.state.assistantMessages.filter((a) => a.userId !== userId);
+    this.state.tasks = this.state.tasks.filter((t) => t.userId !== userId);
+    this.state.hearings = this.state.hearings.filter((h) => h.userId !== userId);
+    this.state.notifications = this.state.notifications.filter((n) => n.userId !== userId);
+    this.state.evidenceItems = this.state.evidenceItems.filter((e) => e.userId !== userId);
+    this.state.litigationStrategies = this.state.litigationStrategies.filter((l) => l.userId !== userId);
+    if (this.engine === "neon") {
+      await deleteUserFromNeon(userId);
+    }
+    await this.persist();
+  }
+  canUserAccessMatter(userId, matter, write = false) {
+    const user = this.state.users.find((u) => u.id === userId);
+    if (!user) return false;
+    const sameOrg = Boolean(
+      user.organizationId && matter.organizationId && user.organizationId === matter.organizationId
+    );
+    const isOwner = matter.userId === userId;
+    const isAssigned = Boolean(matter.assignedUserIds?.includes(userId));
+    if (!isOwner && !(sameOrg && (user.orgRole !== "client" || isAssigned))) {
+      return false;
+    }
+    if (write && user.orgRole === "client") {
+      return false;
+    }
+    return true;
+  }
+  getMatterForUser(userId, matterId, write = false) {
+    const matter = this.state.matters.find((m) => m.id === matterId);
+    if (!matter) return void 0;
+    return this.canUserAccessMatter(userId, matter, write) ? matter : void 0;
+  }
+  getSubscriptionForOrg(orgId) {
+    return this.state.subscriptions.find((s) => s.organizationId === orgId);
+  }
+  checkAiQuota(userId) {
+    const user = this.state.users.find((u) => u.id === userId);
+    if (!user || !user.organizationId) return { allowed: true };
+    const sub = this.getSubscriptionForOrg(user.organizationId);
+    if (!sub) return { allowed: true };
+    if (sub.status !== "active" && sub.status !== "trialing") {
+      return { allowed: false, reason: "Organization subscription is inactive.", subscription: sub };
+    }
+    if (new Date(sub.expiresAt).getTime() < Date.now()) {
+      return { allowed: false, reason: "Organization subscription has expired.", subscription: sub };
+    }
+    if (sub.aiQueriesUsed >= sub.aiQueriesLimit) {
+      return {
+        allowed: false,
+        reason: `Monthly AI query limit (${sub.aiQueriesLimit}) reached for ${sub.tier} plan. Upgrade in Settings or Admin.`,
+        subscription: sub
+      };
+    }
+    return { allowed: true, subscription: sub };
+  }
+  recordAiUsage(userId, tokensUsed) {
+    const user = this.state.users.find((u) => u.id === userId);
+    if (!user?.organizationId) return;
+    const sub = this.getSubscriptionForOrg(user.organizationId);
+    if (!sub) return;
+    sub.aiQueriesUsed += 1;
+    sub.aiTokensUsed += Math.max(0, Math.round(tokensUsed));
+    sub.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+  }
+  async updateSubscriptionTier(orgId, tier) {
+    await this.ensureReady();
+    const org = this.state.organizations.find((o) => o.id === orgId);
+    if (!org) throw new Error("Organization not found.");
+    org.tier = tier;
+    const limits = TIER_LIMITS[tier];
+    let sub = this.getSubscriptionForOrg(orgId);
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    if (!sub) {
+      sub = {
+        id: crypto5.randomUUID(),
+        organizationId: orgId,
+        tier,
+        status: "active",
+        ...limits,
+        aiQueriesUsed: 0,
+        aiTokensUsed: 0,
+        storageUsedMb: 0,
+        expiresAt: new Date(Date.now() + 365 * 864e5).toISOString(),
+        updatedAt: now
+      };
+      this.state.subscriptions.push(sub);
+    } else {
+      sub.tier = tier;
+      sub.aiQueriesLimit = limits.aiQueriesLimit;
+      sub.storageLimitMb = limits.storageLimitMb;
+      sub.maxMatters = limits.maxMatters;
+      sub.maxSeats = limits.maxSeats;
+      sub.updatedAt = now;
+    }
+    await this.persist();
+    return sub;
+  }
+  logActivity(input) {
+    const entry = {
+      ...input,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.activityLogs.unshift(entry);
+    if (this.state.activityLogs.length > 500) {
+      this.state.activityLogs = this.state.activityLogs.slice(0, 500);
+    }
+    return entry;
+  }
+  logAuditEvent(input) {
+    const entry = {
+      ...input,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.auditEvents.unshift(entry);
+    if (this.state.auditEvents.length > 500) {
+      this.state.auditEvents = this.state.auditEvents.slice(0, 500);
+    }
+    return entry;
+  }
+  getAuditEvents(orgId) {
+    if (!orgId) return this.state.auditEvents.slice(0, 150);
+    return this.state.auditEvents.filter((e) => e.organizationId === orgId).slice(0, 150);
+  }
+  addNotification(input) {
+    const item = {
+      ...input,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.notifications.unshift(item);
+    return item;
+  }
+  markNotificationRead(userId, notificationId) {
+    const item = this.state.notifications.find(
+      (n) => n.id === notificationId && n.userId === userId
+    );
+    if (!item) return null;
+    item.read = true;
+    return item;
+  }
+  async getWorkspaceBundle(userId) {
+    await this.ensureReady();
+    let user = this.state.users.find((u) => u.id === userId);
+    if (!user && this.engine === "neon") {
+      await this.ensureReady(true);
+      user = this.state.users.find((u) => u.id === userId);
+    }
+    if (!user) return null;
+    const orgId = user.organizationId || "";
+    const organization = this.state.organizations.find((o) => o.id === orgId);
+    const organizationMembers = this.state.organizationMembers.filter((m) => m.organizationId === orgId).map((m) => {
+      const u = this.state.users.find((usr) => usr.id === m.userId);
+      return {
+        ...m,
+        fullName: u?.fullName || "Member",
+        email: u?.email || ""
+      };
+    });
+    const accessibleMatters = this.state.matters.filter((m) => this.canUserAccessMatter(userId, m, false)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const accessibleMatterIds = new Set(accessibleMatters.map((m) => m.id));
+    return {
+      user: this.toPublicUser(user),
+      organization,
+      organizationMembers,
+      matters: accessibleMatters,
+      clients: this.state.clients.filter((c) => c.organizationId === orgId || c.userId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+      tasks: this.state.tasks.filter((t) => accessibleMatterIds.has(t.matterId) || t.userId === userId).sort((a, b) => a.dueDate.localeCompare(b.dueDate)),
+      hearings: this.state.hearings.filter((h) => accessibleMatterIds.has(h.matterId) || h.userId === userId).sort((a, b) => b.hearingDate.localeCompare(a.hearingDate)),
+      researchMemos: this.state.researchMemos.filter((r) => accessibleMatterIds.has(r.matterId) || r.userId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+      drafts: this.state.drafts.filter((d) => accessibleMatterIds.has(d.matterId) || d.userId === userId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+      vaultDocuments: this.state.vaultDocuments.filter((v) => accessibleMatterIds.has(v.matterId) || v.userId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+      contractReviews: this.state.contractReviews.filter((c) => accessibleMatterIds.has(c.matterId) || c.userId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+      courtroomSessions: this.state.courtroomSessions.filter((s) => accessibleMatterIds.has(s.matterId) || s.userId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+      trackedCases: this.state.trackedCases.filter((tc) => accessibleMatterIds.has(tc.matterId) || tc.userId === userId).sort((a, b) => a.nextHearingDate.localeCompare(b.nextHearingDate)),
+      deadlines: this.state.deadlines.filter((dl) => accessibleMatterIds.has(dl.matterId) || dl.userId === userId).sort((a, b) => a.dueDate.localeCompare(b.dueDate)),
+      meetingBriefs: this.state.meetingBriefs.filter((mb) => accessibleMatterIds.has(mb.matterId) || mb.userId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+      whatsappMessages: this.state.whatsappMessages.filter((w) => w.userId === userId).sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+      assistantMessages: this.state.assistantMessages.filter((a) => a.userId === userId).sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+      notifications: this.state.notifications.filter((n) => n.userId === userId).slice(0, 40),
+      activityLogs: this.state.activityLogs.filter((al) => al.organizationId === orgId || al.userId === userId).slice(0, 40),
+      subscription: this.getSubscriptionForOrg(orgId),
+      workflowRuns: this.state.workflowRuns.filter((wr) => wr.organizationId === orgId || wr.userId === userId).slice(0, 30),
+      corporateProfiles: this.state.corporateProfiles.filter((cp) => cp.organizationId === orgId || cp.userId === userId).slice(0, 30),
+      evidenceItems: this.state.evidenceItems.filter((ev) => accessibleMatterIds.has(ev.matterId) || ev.userId === userId),
+      litigationStrategies: this.state.litigationStrategies.filter((ls) => accessibleMatterIds.has(ls.matterId) || ls.userId === userId),
+      storageEngine: this.engine
+    };
+  }
+  createMatter(userId, input) {
+    const user = this.state.users.find((u) => u.id === userId);
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const matter = {
+      ...input,
+      id: crypto5.randomUUID(),
+      userId,
+      organizationId: user?.organizationId || "",
+      assignedUserIds: input.assignedUserIds ?? [userId],
+      createdAt: now,
+      updatedAt: now
+    };
+    this.state.matters.unshift(matter);
+    if (user) {
+      this.logActivity({
+        organizationId: user.organizationId || "",
+        userId,
+        actorName: user.fullName,
+        matterId: matter.id,
+        action: "created",
+        entityType: "matter",
+        entityId: matter.id,
+        summary: `Opened matter ${matter.matterCode}: ${matter.title}`
+      });
+    }
+    return matter;
+  }
+  updateMatter(userId, matterId, updates) {
+    const matter = this.getMatterForUser(userId, matterId, true);
+    if (!matter) return null;
+    Object.assign(matter, updates, { updatedAt: (/* @__PURE__ */ new Date()).toISOString() });
+    return matter;
+  }
+  async deleteMatter(userId, matterId) {
+    const matter = this.getMatterForUser(userId, matterId, true);
+    if (!matter) return false;
+    this.state.matters = this.state.matters.filter((m) => m.id !== matterId);
+    this.state.researchMemos = this.state.researchMemos.filter((r) => r.matterId !== matterId);
+    this.state.drafts = this.state.drafts.filter((d) => d.matterId !== matterId);
+    this.state.vaultDocuments = this.state.vaultDocuments.filter((v) => v.matterId !== matterId);
+    this.state.contractReviews = this.state.contractReviews.filter((c) => c.matterId !== matterId);
+    this.state.courtroomSessions = this.state.courtroomSessions.filter((s) => s.matterId !== matterId);
+    this.state.trackedCases = this.state.trackedCases.filter((tc) => tc.matterId !== matterId);
+    this.state.deadlines = this.state.deadlines.filter((dl) => dl.matterId !== matterId);
+    this.state.meetingBriefs = this.state.meetingBriefs.filter((mb) => mb.matterId !== matterId);
+    this.state.tasks = this.state.tasks.filter((t) => t.matterId !== matterId);
+    this.state.hearings = this.state.hearings.filter((h) => h.matterId !== matterId);
+    this.state.evidenceItems = this.state.evidenceItems.filter((e) => e.matterId !== matterId);
+    this.state.litigationStrategies = this.state.litigationStrategies.filter((l) => l.matterId !== matterId);
+    if (this.engine === "neon") {
+      await deleteMatterFromNeon(matterId);
+    }
+    await this.persist();
+    return true;
+  }
+  addClient(input) {
+    const created = {
+      ...input,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.clients.unshift(created);
+    return created;
+  }
+  addTask(input) {
+    const created = {
+      ...input,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.tasks.unshift(created);
+    return created;
+  }
+  updateTaskStatus(userId, taskId, status) {
+    const task = this.state.tasks.find((t) => t.id === taskId);
+    if (!task) return null;
+    if (!this.getMatterForUser(userId, task.matterId, true)) return null;
+    task.status = status;
+    return task;
+  }
+  addHearing(input) {
+    const created = {
+      ...input,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.hearings.unshift(created);
+    return created;
+  }
+  addResearchMemo(memo) {
+    const user = this.state.users.find((u) => u.id === memo.userId);
+    const created = {
+      ...memo,
+      organizationId: memo.organizationId || user?.organizationId || "",
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.researchMemos.unshift(created);
+    if (user) {
+      this.logActivity({
+        organizationId: user.organizationId || "",
+        userId: user.id,
+        actorName: user.fullName,
+        matterId: memo.matterId,
+        action: "researched",
+        entityType: "research_memo",
+        entityId: created.id,
+        summary: `Generated legal research memo: ${memo.query.slice(0, 80)}`
+      });
+    }
+    return created;
+  }
+  createDraft(userId, input) {
+    const user = this.state.users.find((u) => u.id === userId);
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const created = {
+      id: crypto5.randomUUID(),
+      userId,
+      organizationId: user?.organizationId || "",
+      matterId: input.matterId,
+      title: input.title,
+      docType: input.docType,
+      content: input.content,
+      status: input.status ?? "draft",
+      version: 1,
+      versions: [
+        {
+          version: 1,
+          title: input.title,
+          content: input.content,
+          savedAt: now,
+          savedBy: user?.fullName || "Counsel"
+        }
+      ],
+      updatedAt: now
+    };
+    this.state.drafts.unshift(created);
+    if (user) {
+      this.logActivity({
+        organizationId: user.organizationId || "",
+        userId,
+        actorName: user.fullName,
+        matterId: input.matterId,
+        action: "drafted",
+        entityType: "draft",
+        entityId: created.id,
+        summary: `Created draft "${created.title}"`
+      });
+    }
+    return created;
+  }
+  updateDraft(userId, draftId, updates) {
+    const draft = this.state.drafts.find((d) => d.id === draftId);
+    if (!draft || !this.getMatterForUser(userId, draft.matterId, true)) return null;
+    const user = this.state.users.find((u) => u.id === userId);
+    if (updates.title !== void 0) draft.title = updates.title;
+    if (updates.content !== void 0) draft.content = updates.content;
+    if (updates.status !== void 0) draft.status = updates.status;
+    draft.version += 1;
+    draft.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+    draft.versions = [
+      {
+        version: draft.version,
+        title: draft.title,
+        content: draft.content,
+        savedAt: draft.updatedAt,
+        savedBy: user?.fullName || "Counsel"
+      },
+      ...draft.versions ?? []
+    ].slice(0, 20);
+    return draft;
+  }
+  addVaultDocument(doc) {
+    const user = this.state.users.find((u) => u.id === doc.userId);
+    const created = {
+      ...doc,
+      organizationId: doc.organizationId || user?.organizationId || "",
+      processingStatus: doc.processingStatus || "completed",
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.vaultDocuments.unshift(created);
+    if (user && doc.fileSizeBytes) {
+      const sub = this.getSubscriptionForOrg(user.organizationId || "");
+      if (sub) {
+        sub.storageUsedMb = Number((sub.storageUsedMb + doc.fileSizeBytes / (1024 * 1024)).toFixed(2));
+      }
+    }
+    return created;
+  }
+  updateVaultDocument(userId, docId, updates) {
+    const doc = this.state.vaultDocuments.find((d) => d.id === docId);
+    if (!doc || !this.getMatterForUser(userId, doc.matterId, true)) return null;
+    Object.assign(doc, updates);
+    return doc;
+  }
+  addContractReview(review) {
+    const user = this.state.users.find((u) => u.id === review.userId);
+    const created = {
+      ...review,
+      organizationId: review.organizationId || user?.organizationId || "",
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.contractReviews.unshift(created);
+    return created;
+  }
+  updateRedlineClauseDecision(userId, reviewId, clauseId, decision) {
+    const review = this.state.contractReviews.find((c) => c.id === reviewId);
+    if (!review || !this.getMatterForUser(userId, review.matterId, true)) return null;
+    const clause = review.clauses.find((cl) => cl.id === clauseId);
+    if (!clause) return null;
+    clause.decision = decision;
+    return review;
+  }
+  createCourtroomSession(session) {
+    const created = {
+      ...session,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.courtroomSessions.unshift(created);
+    return created;
+  }
+  appendCourtroomTurns(userId, sessionId, newTurns, newVulnerabilities) {
+    const session = this.state.courtroomSessions.find((s) => s.id === sessionId);
+    if (!session || !this.getMatterForUser(userId, session.matterId, true)) return null;
+    session.turns.push(...newTurns);
+    if (newVulnerabilities && newVulnerabilities.length > 0) {
+      session.vulnerabilities = Array.from(/* @__PURE__ */ new Set([...session.vulnerabilities, ...newVulnerabilities]));
+    }
+    return session;
+  }
+  addTrackedCase(item) {
+    const created = {
+      ...item,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.trackedCases.push(created);
+    return created;
+  }
+  updateTrackedCaseStatus(userId, caseId, status) {
+    const item = this.state.trackedCases.find((tc) => tc.id === caseId);
+    if (!item || !this.getMatterForUser(userId, item.matterId, true)) return null;
+    item.status = status;
+    return item;
+  }
+  addDeadline(item) {
+    const created = {
+      ...item,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.deadlines.push(created);
+    return created;
+  }
+  toggleDeadline(userId, deadlineId) {
+    const item = this.state.deadlines.find((d) => d.id === deadlineId);
+    if (!item || !this.getMatterForUser(userId, item.matterId, true)) return null;
+    item.completed = !item.completed;
+    return item;
+  }
+  addMeetingBrief(brief) {
+    const created = {
+      ...brief,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.meetingBriefs.unshift(created);
+    return created;
+  }
+  addWhatsAppMessage(msg) {
+    const created = {
+      ...msg,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.whatsappMessages.push(created);
+    return created;
+  }
+  addAssistantMessage(msg) {
+    const created = {
+      ...msg,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.assistantMessages.push(created);
+    const userMsgs = this.state.assistantMessages.filter((m) => m.userId === msg.userId);
+    if (userMsgs.length > 120) {
+      const oldestId = userMsgs[0].id;
+      this.state.assistantMessages = this.state.assistantMessages.filter((m) => m.id !== oldestId);
+    }
+    return created;
+  }
+  async clearAssistantMessages(userId) {
+    this.state.assistantMessages = this.state.assistantMessages.filter((m) => m.userId !== userId);
+    if (this.engine === "neon") {
+      await clearAssistantMessagesFromNeon(userId);
+    }
+    await this.persist();
+  }
+  addWorkflowRun(run) {
+    const created = {
+      ...run,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.workflowRuns.unshift(created);
+    return created;
+  }
+  approveWorkflowRun(userId, runId) {
+    const user = this.state.users.find((u) => u.id === userId);
+    const run = this.state.workflowRuns.find(
+      (r) => r.id === runId && (r.userId === userId || user?.organizationId && r.organizationId === user.organizationId)
+    );
+    if (!run) return null;
+    run.status = "completed";
+    run.approvedByUserId = userId;
+    for (const s of run.steps) {
+      if (s.status === "awaiting_approval") s.status = "completed";
+    }
+    return run;
+  }
+  addCorporateProfile(profile) {
+    const created = {
+      ...profile,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.corporateProfiles.unshift(created);
+    return created;
+  }
+  addEvidenceItem(item) {
+    const created = {
+      ...item,
+      id: crypto5.randomUUID(),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.state.evidenceItems.unshift(created);
+    return created;
+  }
+  upsertLitigationStrategy(input) {
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const existing = this.state.litigationStrategies.find((l) => l.matterId === input.matterId);
+    if (existing) {
+      Object.assign(existing, input, { updatedAt: now });
+      return existing;
+    }
+    const created = {
+      ...input,
+      id: crypto5.randomUUID(),
+      updatedAt: now
+    };
+    this.state.litigationStrategies.unshift(created);
+    return created;
+  }
+  getSystemCounts() {
+    return {
+      organizations: this.state.organizations.length,
+      users: this.state.users.length,
+      matters: this.state.matters.length,
+      drafts: this.state.drafts.length,
+      vaultDocuments: this.state.vaultDocuments.length,
+      failedVaultJobs: this.state.vaultDocuments.filter((v) => v.processingStatus === "failed").length,
+      queuedVaultJobs: this.state.vaultDocuments.filter(
+        (v) => v.processingStatus === "queued" || v.processingStatus === "processing"
+      ).length,
+      workflowRuns: this.state.workflowRuns.length,
+      auditEvents: this.state.auditEvents.length
+    };
+  }
+};
+var repository = new WorkspaceRepository();
+
+// src/server/extendedRoutes.ts
+function errMsg(err) {
+  if (err instanceof z.ZodError) {
+    return err.issues.map((i) => `${i.path.join(".") || "input"}: ${i.message}`).join("; ");
+  }
+  if (err instanceof Error) return err.message;
+  return "Unexpected server error";
+}
+function registerExtendedRoutes(app, metrics) {
+  const requireAdmin = (req, res, next) => {
+    requireAuth(req, res, async () => {
+      const user = await repository.getUserById(req.authUser.userId);
+      if (!user || !isUserAdminRole(user)) {
+        repository.logAuditEvent({
+          organizationId: user?.organizationId || "",
+          userId: req.authUser.userId,
+          actorEmail: req.authUser.email,
+          eventType: "admin_access_denied",
+          resourceType: "admin",
+          status: "denied",
+          details: `Unauthorized admin route access attempted: ${req.path}`
+        });
+        await repository.persist().catch(() => {
+        });
+        res.status(403).json({ error: "Access denied: Administrator privileges required." });
+        return;
+      }
+      next();
+    });
+  };
+  app.patch("/api/matters/:id", requireAuth, async (req, res) => {
+    try {
+      const schema = z.object({
+        title: z.string().min(3).max(200).optional(),
+        status: z.enum(["active", "pending_hearing", "in_review", "closed"]).optional(),
+        forum: z.string().min(2).max(200).optional(),
+        opposingParty: z.string().max(160).optional(),
+        clientName: z.string().min(2).max(160).optional(),
+        summaryFacts: z.string().max(6e3).optional(),
+        cnrNumber: z.string().max(80).optional(),
+        caseType: z.string().max(100).optional(),
+        assignedAdvocate: z.string().max(160).optional(),
+        filingDate: z.string().max(30).optional()
+      });
+      const data = schema.parse(req.body);
+      const updated = repository.updateMatter(req.authUser.userId, String(req.params.id), data);
+      if (!updated) {
+        res.status(404).json({ error: "Matter not found or permission denied." });
+        return;
+      }
+      await repository.persist();
+      res.json(updated);
+    } catch (err) {
+      res.status(400).json({ error: errMsg(err) });
+    }
+  });
+  app.post("/api/clients", requireAuth, async (req, res) => {
+    try {
+      const schema = z.object({
+        name: z.string().min(2).max(160),
+        email: z.string().email().or(z.literal("")).default(""),
+        phone: z.string().max(40).default(""),
+        company: z.string().max(160).default(""),
+        address: z.string().max(300).default(""),
+        panOrCin: z.string().max(40).optional(),
+        notes: z.string().max(2e3).default(""),
+        portalAccessEnabled: z.boolean().default(false)
+      });
+      const data = schema.parse(req.body);
+      const user = await repository.getUserById(req.authUser.userId);
+      if (!user || user.orgRole === "client") {
+        res.status(403).json({ error: "Permission denied to create client profiles." });
+        return;
+      }
+      const client = repository.addClient({
+        ...data,
+        organizationId: user.organizationId || "",
+        userId: user.id
+      });
+      await repository.persist();
+      res.status(201).json(client);
+    } catch (err) {
+      res.status(400).json({ error: errMsg(err) });
+    }
+  });
+  app.post("/api/tasks", requireAuth, async (req, res) => {
+    try {
+      const schema = z.object({
+        matterId: z.string().min(1),
+        title: z.string().min(2).max(200),
+        priority: z.enum(["low", "medium", "high", "urgent"]).default("medium"),
+        dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        assignedToName: z.string().max(120).optional()
+      });
+      const data = schema.parse(req.body);
+      const matter = repository.getMatterForUser(req.authUser.userId, data.matterId, true);
+      if (!matter) {
+        res.status(404).json({ error: "Matter not found or write access denied." });
+        return;
+      }
+      const user = await repository.getUserById(req.authUser.userId);
+      const task = repository.addTask({
+        organizationId: user?.organizationId || matter.organizationId || "",
+        matterId: matter.id,
+        userId: req.authUser.userId,
+        assignedToUserId: req.authUser.userId,
+        assignedToName: data.assignedToName || user?.fullName || "Counsel",
+        title: data.title,
+        priority: data.priority,
+        status: "todo",
+        dueDate: data.dueDate
+      });
+      await repository.persist();
+      res.status(201).json(task);
+    } catch (err) {
+      res.status(400).json({ error: errMsg(err) });
+    }
+  });
+  app.patch("/api/tasks/:id", requireAuth, async (req, res) => {
+    try {
+      const schema = z.object({
+        status: z.enum(["todo", "in_progress", "review", "done"])
+      });
+      const { status } = schema.parse(req.body);
+      const updated = repository.updateTaskStatus(req.authUser.userId, String(req.params.id), status);
+      if (!updated) {
+        res.status(404).json({ error: "Task not found or permission denied." });
+        return;
+      }
+      await repository.persist();
+      res.json(updated);
+    } catch (err) {
+      res.status(400).json({ error: errMsg(err) });
+    }
+  });
+  app.post("/api/hearings", requireAuth, async (req, res) => {
+    try {
+      const schema = z.object({
+        matterId: z.string().min(1),
+        hearingDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        court: z.string().min(2).max(200),
+        courtroom: z.string().max(80).default(""),
+        bench: z.string().max(160).default(""),
+        causeListItem: z.string().max(80).default(""),
+        outcome: z.enum([
+          "scheduled",
+          "heard",
+          "adjourned",
+          "part_heard",
+          "order_reserved",
+          "disposed"
+        ]),
+        nextHearingDate: z.string().optional(),
+        adjournmentReason: z.string().max(400).optional(),
+        notes: z.string().max(2e3).default("")
+      });
+      const data = schema.parse(req.body);
+      const matter = repository.getMatterForUser(req.authUser.userId, data.matterId, true);
+      if (!matter) {
+        res.status(404).json({ error: "Matter not found." });
+        return;
+      }
+      const user = await repository.getUserById(req.authUser.userId);
+      const hearing = repository.addHearing({
+        ...data,
+        organizationId: user?.organizationId || matter.organizationId || "",
+        userId: req.authUser.userId
+      });
+      await repository.persist();
+      res.status(201).json(hearing);
+    } catch (err) {
+      res.status(400).json({ error: errMsg(err) });
+    }
+  });
+  app.patch("/api/vault/:id", requireAuth, async (req, res) => {
+    try {
+      const schema = z.object({
+        extractedText: z.string().max(12e4).optional(),
+        translatedText: z.string().max(12e4).optional(),
+        chronology: z.array(
+          z.object({
+            date: z.string(),
+            event: z.string(),
+            sourceDoc: z.string(),
+            pageOrPara: z.string().optional(),
+            significance: z.string(),
+            userCorrected: z.boolean().optional()
+          })
+        ).optional(),
+        processingStatus: z.enum(["uploaded", "queued", "processing", "review_required", "completed", "failed"]).optional()
+      });
+      const data = schema.parse(req.body);
+      const updated = repository.updateVaultDocument(
+        req.authUser.userId,
+        String(req.params.id),
+        data
+      );
+      if (!updated) {
+        res.status(404).json({ error: "Vault document not found." });
+        return;
+      }
+      await repository.persist();
+      res.json(updated);
+    } catch (err) {
+      res.status(400).json({ error: errMsg(err) });
+    }
+  });
+  app.post("/api/ai/workflows/run", requireAuth, async (req, res) => {
+    try {
+      const schema = z.object({
+        matterId: z.string().nullable().optional(),
+        workflowType: z.enum([
+          "full_matter_brief",
+          "research_verification",
+          "draft_audit",
+          "contract_risk_audit",
+          "compliance_deadline_check"
+        ]),
+        goal: z.string().min(5).max(3e3),
+        extraContext: z.string().max(12e3).optional()
+      });
+      const data = schema.parse(req.body);
+      const userId = req.authUser.userId;
+      const quota = repository.checkAiQuota(userId);
+      if (!quota.allowed) {
+        res.status(402).json({ error: quota.reason });
+        return;
+      }
+      const user = await repository.getUserById(userId);
+      const matter = data.matterId ? repository.getMatterForUser(userId, data.matterId) ?? null : null;
+      if (data.matterId && !matter) {
+        res.status(404).json({ error: "Matter not found." });
+        return;
+      }
+      const runData = await executeMultiAgentWorkflow({
+        organizationId: user?.organizationId || "",
+        userId,
+        matter,
+        jurisdiction: matter?.jurisdiction ?? user?.defaultJurisdiction ?? "india_litigation",
+        workflowType: data.workflowType,
+        goal: data.goal,
+        extraContext: data.extraContext
+      });
+      const savedRun = repository.addWorkflowRun(runData);
+      repository.recordAiUsage(userId, savedRun.totalTokens);
+      await repository.persist();
+      res.status(201).json(savedRun);
+    } catch (err) {
+      res.status(500).json({ error: errMsg(err) });
+    }
+  });
+  app.post("/api/ai/workflows/:id/approve", requireAuth, async (req, res) => {
+    const approved = repository.approveWorkflowRun(req.authUser.userId, String(req.params.id));
+    if (!approved) {
+      res.status(404).json({ error: "Workflow run not found." });
+      return;
+    }
+    await repository.persist();
+    res.json(approved);
+  });
+  app.post("/api/ai/translate", requireAuth, async (req, res) => {
+    try {
+      const schema = z.object({
+        sourceText: z.string().min(3).max(2e4),
+        sourceLanguage: z.string().max(40).default("English"),
+        targetLanguage: z.enum(SUPPORTED_TRANSLATION_LANGUAGES),
+        jurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"]).default("india_litigation")
+      });
+      const data = schema.parse(req.body);
+      const quota = repository.checkAiQuota(req.authUser.userId);
+      if (!quota.allowed) {
+        res.status(402).json({ error: quota.reason });
+        return;
+      }
+      const result = await translateLegalContent(data);
+      repository.recordAiUsage(req.authUser.userId, Math.ceil(data.sourceText.length / 3));
+      await repository.persist();
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: errMsg(err) });
+    }
+  });
+  app.post("/api/corporate/lookup", requireAuth, async (req, res) => {
+    try {
+      const schema = z.object({
+        query: z.string().min(2).max(160),
+        matterId: z.string().optional()
+      });
+      const data = schema.parse(req.body);
+      const user = await repository.getUserById(req.authUser.userId);
+      if (!user) {
+        res.status(404).json({ error: "User not found." });
+        return;
+      }
+      const profileData = await lookupCorporateEntity({
+        query: data.query,
+        organizationId: user.organizationId || "",
+        userId: user.id,
+        matterId: data.matterId
+      });
+      const saved = repository.addCorporateProfile(profileData);
+      await repository.persist();
+      res.status(201).json({
+        profile: saved,
+        providerConfigured: isCorporateProviderConfigured()
+      });
+    } catch (err) {
+      res.status(500).json({ error: errMsg(err) });
+    }
+  });
+  app.get("/api/intelligence/graph", requireAuth, async (req, res) => {
+    const matterId = String(req.query.matterId || "");
+    const bundle = await repository.getWorkspaceBundle(req.authUser.userId);
+    if (!bundle) {
+      res.status(404).json({ error: "Workspace not found." });
+      return;
+    }
+    const matter = (matterId ? bundle.matters.find((m) => m.id === matterId) : bundle.matters[0]) ?? null;
+    const memos = bundle.researchMemos.filter((m) => !matter || m.matterId === matter.id);
+    const docs = bundle.vaultDocuments.filter((d) => !matter || d.matterId === matter.id);
+    const graph = buildMatterKnowledgeGraph({ matter, memos, vaultDocuments: docs });
+    const conflicts = matter ? detectPrecedentConflicts(`${matter.title} ${matter.summaryFacts}`, matter.jurisdiction) : [];
+    res.json({ graph, conflicts });
+  });
+  app.post("/api/intelligence/strategy", requireAuth, async (req, res) => {
+    try {
+      const schema = z.object({
+        matterId: z.string().min(1)
+      });
+      const { matterId } = schema.parse(req.body);
+      const userId = req.authUser.userId;
+      const matter = repository.getMatterForUser(userId, matterId, true);
+      if (!matter) {
+        res.status(404).json({ error: "Matter not found." });
+        return;
+      }
+      const user = await repository.getUserById(userId);
+      const strategyData = await generateLitigationStrategy({
+        matter,
+        organizationId: user?.organizationId || matter.organizationId || "",
+        userId
+      });
+      const saved = repository.upsertLitigationStrategy(strategyData);
+      await repository.persist();
+      res.status(201).json(saved);
+    } catch (err) {
+      res.status(500).json({ error: errMsg(err) });
+    }
+  });
+  app.post("/api/intelligence/evidence", requireAuth, async (req, res) => {
+    try {
+      const schema = z.object({
+        matterId: z.string().min(1),
+        exhibitNumber: z.string().min(1).max(40),
+        title: z.string().min(2).max(200),
+        sourceDocumentId: z.string().optional(),
+        witnessName: z.string().max(160).optional(),
+        admissibilityStatus: z.enum([
+          "verified_63_bsa",
+          "primary_original",
+          "requires_certificate",
+          "contested"
+        ]),
+        notes: z.string().max(2e3).default("")
+      });
+      const data = schema.parse(req.body);
+      const matter = repository.getMatterForUser(req.authUser.userId, data.matterId, true);
+      if (!matter) {
+        res.status(404).json({ error: "Matter not found." });
+        return;
+      }
+      const user = await repository.getUserById(req.authUser.userId);
+      const created = repository.addEvidenceItem({
+        ...data,
+        organizationId: user?.organizationId || matter.organizationId || "",
+        userId: req.authUser.userId
+      });
+      await repository.persist();
+      res.status(201).json(created);
+    } catch (err) {
+      res.status(400).json({ error: errMsg(err) });
+    }
+  });
+  app.patch("/api/notifications/:id/read", requireAuth, async (req, res) => {
+    const updated = repository.markNotificationRead(req.authUser.userId, String(req.params.id));
+    if (!updated) {
+      res.status(404).json({ error: "Notification not found." });
+      return;
+    }
+    await repository.persist();
+    res.json(updated);
+  });
+  app.post("/api/subscription/upgrade", requireAuth, async (req, res) => {
+    try {
+      const schema = z.object({
+        tier: z.enum(["FREE", "PRO", "CHAMBERS", "ENTERPRISE"])
+      });
+      const { tier } = schema.parse(req.body);
+      const user = await repository.getUserById(req.authUser.userId);
+      if (!user?.organizationId) {
+        res.status(400).json({ error: "Organization context missing." });
+        return;
+      }
+      if (user.orgRole !== "owner" && user.orgRole !== "admin" && !isUserAdminRole(user)) {
+        res.status(403).json({ error: "Only organization owners or administrators can change plans." });
+        return;
+      }
+      const sub = await repository.updateSubscriptionTier(user.organizationId, tier);
+      res.json({
+        subscription: sub,
+        billingNote: "Plan tier updated in development/sandbox mode. Connect payment provider for live billing."
+      });
+    } catch (err) {
+      res.status(400).json({ error: errMsg(err) });
+    }
+  });
+  app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
+    const nv = getNvidiaConfig();
+    const neonCheck = isNeonConfigured() ? await testNeonConnection() : null;
+    res.json({
+      organizations: repository.getAllOrganizations(),
+      auditEvents: repository.getAuditEvents(),
+      counts: repository.getSystemCounts(),
+      metrics,
+      health: {
+        storageEngine: repository.engine,
+        neon: neonCheck,
+        neonSync: getNeonHealthSnapshot(),
+        lastPersistError: repository.lastPersistError,
+        aiEngine: {
+          nvidiaConfigured: nv.configured,
+          geminiConfigured: isGeminiConfigured(),
+          primaryModel: nv.primaryModel,
+          fastModel: nv.fastModel
+        },
+        corporateProviderConfigured: isCorporateProviderConfigured()
+      }
+    });
+  });
+  app.post("/api/admin/organizations/:orgId/subscription", requireAdmin, async (req, res) => {
+    try {
+      const schema = z.object({
+        tier: z.enum(["FREE", "PRO", "CHAMBERS", "ENTERPRISE"])
+      });
+      const { tier } = schema.parse(req.body);
+      const sub = await repository.updateSubscriptionTier(
+        String(req.params.orgId),
+        tier
+      );
+      res.json({ subscription: sub });
+    } catch (err) {
+      res.status(400).json({ error: errMsg(err) });
+    }
+  });
 }
 
 // src/lib/legal/limitationCalculator.ts
@@ -5183,7 +8140,7 @@ function parseWhatsAppCommand(input) {
 
 // src/server/createApp.ts
 var PORT = Number(process.env.PORT) || 3e3;
-var IS_PROD = process.env.NODE_ENV === "production";
+var IS_PROD2 = process.env.NODE_ENV === "production";
 var ALLOWED_DOC_MIMES = /* @__PURE__ */ new Set([
   "application/pdf",
   "image/png",
@@ -5201,7 +8158,7 @@ var ALLOWED_AUDIO_MIMES = /* @__PURE__ */ new Set([
   "audio/m4a"
 ]);
 function extractErrorMessage(err) {
-  if (err instanceof z.ZodError) {
+  if (err instanceof z2.ZodError) {
     return err.issues.map((i) => `${i.path.join(".") || "input"}: ${i.message}`).join("; ");
   }
   if (err instanceof Error) return err.message;
@@ -5223,27 +8180,68 @@ async function createExpressApp(options = {}) {
     if (req.body && typeof req.body === "object" && !req._body) {
       req._body = true;
     }
-    const matchedPath = req.headers["x-matched-path"] || req.headers["x-forwarded-uri"] || "";
-    if (matchedPath && matchedPath.startsWith("/api") && (req.url === "/api" || req.url === "/api/")) {
-      req.url = matchedPath;
-    } else if (req.url && !req.url.startsWith("/api")) {
-      req.url = "/api" + (req.url.startsWith("/") ? req.url : "/" + req.url);
+    if (!includeStatic) {
+      const matchedPath = req.headers["x-matched-path"] || req.headers["x-forwarded-uri"] || "";
+      if (matchedPath && matchedPath.startsWith("/api") && (req.url === "/api" || req.url === "/api/")) {
+        req.url = matchedPath;
+      } else if (req.url && !req.url.startsWith("/api")) {
+        req.url = "/api" + (req.url.startsWith("/") ? req.url : "/" + req.url);
+      }
     }
     next();
   });
   app.use(express.json({ limit: "20mb" }));
-  app.use((_req, res, next) => {
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  const metrics = {
+    totalRequests: 0,
+    errorCount: 0,
+    aiRequestCount: 0,
+    aiFailureCount: 0,
+    avgLatencyMs: 0,
+    startedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  let totalLatencyAccum = 0;
+  app.use((req, res, next) => {
+    const start = Date.now();
+    const isAi = req.path.startsWith("/api/ai/");
+    if (isAi) metrics.aiRequestCount += 1;
+    metrics.totalRequests += 1;
+    res.on("finish", () => {
+      const elapsed = Date.now() - start;
+      totalLatencyAccum += elapsed;
+      metrics.avgLatencyMs = Math.round(totalLatencyAccum / Math.max(1, metrics.totalRequests));
+      if (res.statusCode >= 500) {
+        metrics.errorCount += 1;
+        if (isAi) metrics.aiFailureCount += 1;
+      }
+    });
     next();
   });
+  app.use((_req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+    res.setHeader("Permissions-Policy", "microphone=(self), camera=(), geolocation=()");
+    if (IS_PROD2) {
+      res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    }
+    next();
+  });
+  const authLimiter = createRateLimiter({ windowMs: 6e4, maxRequests: 30, keyPrefix: "auth" });
+  const aiLimiter = createRateLimiter({ windowMs: 6e4, maxRequests: 60, keyPrefix: "ai" });
+  app.use("/api/auth", authLimiter);
+  app.use("/api/ai", aiLimiter);
   app.get("/api/health", async (_req, res) => {
     const nv = getNvidiaConfig();
     const neonCheck = isNeonConfigured() ? await testNeonConnection() : null;
-    res.json({
-      ok: true,
+    const dbOk = !isNeonConfigured() || Boolean(neonCheck?.ok);
+    res.status(dbOk ? 200 : 503).json({
+      ok: dbOk,
       storageEngine: repository.engine,
       neon: neonCheck,
+      neonSync: getNeonHealthSnapshot(),
+      lastPersistError: repository.lastPersistError,
+      counts: repository.getSystemCounts(),
+      metrics,
       aiEngine: {
         nvidiaConfigured: nv.configured,
         geminiConfigured: isGeminiConfigured(),
@@ -5254,27 +8252,39 @@ async function createExpressApp(options = {}) {
   });
   app.post("/api/auth/register", async (req, res) => {
     try {
-      const schema = z.object({
-        email: z.string().email(),
-        password: z.string().min(8, "Password must be at least 8 characters"),
-        fullName: z.string().min(2).max(120),
-        organization: z.string().max(160).optional(),
-        role: z.string().max(80).optional(),
-        defaultJurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"]).optional()
+      const schema = z2.object({
+        email: z2.string().email(),
+        password: z2.string().min(8, "Password must be at least 8 characters"),
+        fullName: z2.string().min(2).max(120),
+        organization: z2.string().max(160).optional(),
+        role: z2.string().max(80).optional(),
+        defaultJurisdiction: z2.enum(["india_litigation", "corporate_ma", "global_multi"]).optional()
       });
       const data = schema.parse(req.body);
       const user = await repository.registerUser(data);
-      const token = signSessionToken(user.id, user.email);
-      res.status(201).json({ token, user });
+      const { token, csrfToken } = signSessionToken(user.id, user.email, user.organizationId);
+      setAuthCookies(res, token, csrfToken);
+      repository.logAuditEvent({
+        organizationId: user.organizationId || "",
+        userId: user.id,
+        actorEmail: user.email,
+        eventType: "auth_register",
+        resourceType: "user",
+        resourceId: user.id,
+        status: "success",
+        details: "New workspace user registered."
+      });
+      await repository.persist();
+      res.status(201).json({ token, csrfToken, user });
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
   });
   app.post("/api/auth/login", async (req, res) => {
     try {
-      const schema = z.object({
-        email: z.string().email(),
-        password: z.string().min(1)
+      const schema = z2.object({
+        email: z2.string().email(),
+        password: z2.string().min(1)
       });
       const data = schema.parse(req.body);
       const user = await repository.authenticateUser(data.email, data.password);
@@ -5282,8 +8292,19 @@ async function createExpressApp(options = {}) {
         res.status(401).json({ error: "Invalid email or password." });
         return;
       }
-      const token = signSessionToken(user.id, user.email);
-      res.json({ token, user });
+      const { token, csrfToken } = signSessionToken(user.id, user.email, user.organizationId);
+      setAuthCookies(res, token, csrfToken);
+      repository.logAuditEvent({
+        organizationId: user.organizationId || "",
+        userId: user.id,
+        actorEmail: user.email,
+        eventType: "auth_login",
+        resourceType: "session",
+        status: "success",
+        details: "User signed in."
+      });
+      await repository.persist();
+      res.json({ token, csrfToken, user });
     } catch (err) {
       res.status(400).json({ error: extractErrorMessage(err) });
     }
@@ -5291,16 +8312,32 @@ async function createExpressApp(options = {}) {
   app.post("/api/auth/demo", async (_req, res) => {
     await repository.ensureReady();
     const user = repository.getDemoUser();
-    const token = signSessionToken(user.id, user.email);
-    res.json({ token, user });
+    const { token, csrfToken } = signSessionToken(user.id, user.email, user.organizationId);
+    setAuthCookies(res, token, csrfToken);
+    res.json({ token, csrfToken, user });
+  });
+  app.post("/api/auth/logout", requireAuth, async (req, res) => {
+    if (req.authUser?.jti) {
+      await repository.revokeToken(req.authUser.jti, req.authUser.exp);
+    }
+    clearAuthCookies(res);
+    res.json({ loggedOut: true });
+  });
+  app.get("/api/auth/me", requireAuth, async (req, res) => {
+    const user = await repository.getUserById(req.authUser.userId);
+    if (!user) {
+      res.status(404).json({ error: "User not found." });
+      return;
+    }
+    res.json({
+      user,
+      subscription: user.organizationId ? repository.getSubscriptionForOrg(user.organizationId) : void 0
+    });
   });
   const requireAdmin = (req, res, next) => {
     requireAuth(req, res, async () => {
       const user = await repository.getUserById(req.authUser.userId);
-      const isAllowed = Boolean(
-        user?.isAdmin || user?.role?.toLowerCase() === "admin" || user?.role?.toLowerCase() === "administrator" || user?.email === "vidhios@admin.com" || user?.email === "chambers@vidhios.in"
-      );
-      if (!isAllowed) {
+      if (!user || !isUserAdminRole(user)) {
         res.status(403).json({ error: "Access denied: Administrator privileges required." });
         return;
       }
@@ -5318,14 +8355,14 @@ async function createExpressApp(options = {}) {
   });
   app.post("/api/admin/users", requireAdmin, async (req, res) => {
     try {
-      const schema = z.object({
-        email: z.string().email(),
-        password: z.string().min(8, "Password must be at least 8 characters"),
-        fullName: z.string().min(2).max(120),
-        organization: z.string().max(160).optional(),
-        role: z.string().max(80).optional(),
-        defaultJurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"]).optional(),
-        isAdmin: z.boolean().optional()
+      const schema = z2.object({
+        email: z2.string().email(),
+        password: z2.string().min(8, "Password must be at least 8 characters"),
+        fullName: z2.string().min(2).max(120),
+        organization: z2.string().max(160).optional(),
+        role: z2.string().max(80).optional(),
+        defaultJurisdiction: z2.enum(["india_litigation", "corporate_ma", "global_multi"]).optional(),
+        isAdmin: z2.boolean().optional()
       });
       const data = schema.parse(req.body);
       const user = await repository.adminCreateUser(data);
@@ -5336,12 +8373,12 @@ async function createExpressApp(options = {}) {
   });
   app.put("/api/admin/users/:id", requireAdmin, async (req, res) => {
     try {
-      const schema = z.object({
-        fullName: z.string().min(2).max(120).optional(),
-        organization: z.string().max(160).optional(),
-        role: z.string().max(80).optional(),
-        defaultJurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"]).optional(),
-        isAdmin: z.boolean().optional()
+      const schema = z2.object({
+        fullName: z2.string().min(2).max(120).optional(),
+        organization: z2.string().max(160).optional(),
+        role: z2.string().max(80).optional(),
+        defaultJurisdiction: z2.enum(["india_litigation", "corporate_ma", "global_multi"]).optional(),
+        isAdmin: z2.boolean().optional()
       });
       const data = schema.parse(req.body);
       const user = await repository.adminUpdateUser(req.params.id, data);
@@ -5352,8 +8389,8 @@ async function createExpressApp(options = {}) {
   });
   app.post("/api/admin/users/:id/reset-password", requireAdmin, async (req, res) => {
     try {
-      const schema = z.object({
-        password: z.string().min(8, "Password must be at least 8 characters")
+      const schema = z2.object({
+        password: z2.string().min(8, "Password must be at least 8 characters")
       });
       const data = schema.parse(req.body);
       await repository.adminResetPassword(req.params.id, data.password);
@@ -5393,15 +8430,15 @@ async function createExpressApp(options = {}) {
   });
   app.post("/api/matters", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        title: z.string().min(3).max(200),
-        matterCode: z.string().min(2).max(60),
-        clientName: z.string().min(2).max(160),
-        opposingParty: z.string().max(160).default(""),
-        jurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"]),
-        forum: z.string().min(2).max(200),
-        status: z.enum(["active", "pending_hearing", "in_review", "closed"]).default("active"),
-        summaryFacts: z.string().max(6e3).default("")
+      const schema = z2.object({
+        title: z2.string().min(3).max(200),
+        matterCode: z2.string().min(2).max(60),
+        clientName: z2.string().min(2).max(160),
+        opposingParty: z2.string().max(160).default(""),
+        jurisdiction: z2.enum(["india_litigation", "corporate_ma", "global_multi"]),
+        forum: z2.string().min(2).max(200),
+        status: z2.enum(["active", "pending_hearing", "in_review", "closed"]).default("active"),
+        summaryFacts: z2.string().max(6e3).default("")
       });
       const data = schema.parse(req.body);
       const matter = repository.createMatter(req.authUser.userId, data);
@@ -5412,21 +8449,20 @@ async function createExpressApp(options = {}) {
     }
   });
   app.delete("/api/matters/:id", requireAuth, async (req, res) => {
-    const deleted = repository.deleteMatter(req.authUser.userId, String(req.params.id));
+    const deleted = await repository.deleteMatter(req.authUser.userId, String(req.params.id));
     if (!deleted) {
       res.status(404).json({ error: "Matter not found." });
       return;
     }
-    await repository.persist();
     res.json({ deleted: true });
   });
   app.post("/api/drafts", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        title: z.string().min(2).max(200),
-        docType: z.string().min(2).max(100),
-        content: z.string().max(12e4)
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        title: z2.string().min(2).max(200),
+        docType: z2.string().min(2).max(100),
+        content: z2.string().max(12e4)
       });
       const data = schema.parse(req.body);
       if (!repository.getMatterForUser(req.authUser.userId, data.matterId)) {
@@ -5442,9 +8478,10 @@ async function createExpressApp(options = {}) {
   });
   app.patch("/api/drafts/:id", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        title: z.string().min(2).max(200).optional(),
-        content: z.string().max(12e4).optional()
+      const schema = z2.object({
+        title: z2.string().min(2).max(200).optional(),
+        content: z2.string().max(12e4).optional(),
+        status: z2.enum(["draft", "awaiting_review", "approved"]).optional()
       });
       const data = schema.parse(req.body);
       const updated = repository.updateDraft(req.authUser.userId, String(req.params.id), data);
@@ -5460,8 +8497,8 @@ async function createExpressApp(options = {}) {
   });
   app.patch("/api/contract-reviews/:reviewId/clauses/:clauseId", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        decision: z.enum(["pending", "accepted", "rejected"])
+      const schema = z2.object({
+        decision: z2.enum(["pending", "accepted", "rejected"])
       });
       const { decision } = schema.parse(req.body);
       const updated = repository.updateRedlineClauseDecision(
@@ -5482,18 +8519,18 @@ async function createExpressApp(options = {}) {
   });
   app.post("/api/cases", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        caseNumber: z.string().min(2).max(80),
-        cnrNumber: z.string().max(80).default(""),
-        court: z.string().min(2).max(160),
-        courtroom: z.string().max(80).default(""),
-        bench: z.string().max(160).default(""),
-        causeListItem: z.string().max(80).default(""),
-        nextHearingDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-        stage: z.string().min(2).max(160),
-        status: z.enum(["listed", "in_session", "adjourned", "disposed"]).default("listed"),
-        notes: z.string().max(2e3).default("")
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        caseNumber: z2.string().min(2).max(80),
+        cnrNumber: z2.string().max(80).default(""),
+        court: z2.string().min(2).max(160),
+        courtroom: z2.string().max(80).default(""),
+        bench: z2.string().max(160).default(""),
+        causeListItem: z2.string().max(80).default(""),
+        nextHearingDate: z2.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        stage: z2.string().min(2).max(160),
+        status: z2.enum(["listed", "in_session", "adjourned", "disposed"]).default("listed"),
+        notes: z2.string().max(2e3).default("")
       });
       const data = schema.parse(req.body);
       if (!repository.getMatterForUser(req.authUser.userId, data.matterId)) {
@@ -5509,8 +8546,8 @@ async function createExpressApp(options = {}) {
   });
   app.patch("/api/cases/:id", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        status: z.enum(["listed", "in_session", "adjourned", "disposed"])
+      const schema = z2.object({
+        status: z2.enum(["listed", "in_session", "adjourned", "disposed"])
       });
       const { status } = schema.parse(req.body);
       const updated = repository.updateTrackedCaseStatus(
@@ -5530,14 +8567,14 @@ async function createExpressApp(options = {}) {
   });
   app.post("/api/deadlines", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        title: z.string().min(2).max(200),
-        statuteArticle: z.string().min(2).max(160),
-        triggerDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-        dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-        graceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-        notes: z.string().max(2e3).default("")
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        title: z2.string().min(2).max(200),
+        statuteArticle: z2.string().min(2).max(160),
+        triggerDate: z2.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        dueDate: z2.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        graceDate: z2.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        notes: z2.string().max(2e3).default("")
       });
       const data = schema.parse(req.body);
       if (!repository.getMatterForUser(req.authUser.userId, data.matterId)) {
@@ -5566,9 +8603,9 @@ async function createExpressApp(options = {}) {
   });
   app.post("/api/whatsapp/command", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().nullable().optional(),
-        text: z.string().min(1).max(2e3)
+      const schema = z2.object({
+        matterId: z2.string().nullable().optional(),
+        text: z2.string().min(1).max(2e3)
       });
       const { matterId, text } = schema.parse(req.body);
       const userId = req.authUser.userId;
@@ -5661,6 +8698,7 @@ Facts: ${activeMatter.summaryFacts}` : "No active matter selected.";
         body: replyBody,
         commandTag
       });
+      await repository.persist();
       res.json({ userMsg, assistantMsg, createdDeadline });
     } catch (err) {
       res.status(500).json({ error: extractErrorMessage(err) });
@@ -5668,13 +8706,27 @@ Facts: ${activeMatter.summaryFacts}` : "No active matter selected.";
   });
   app.post("/api/ai/research", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        query: z.string().min(5).max(3e3),
-        jurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"]),
-        tier: z.enum(["fast", "expert"]).optional().default("fast")
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        query: z2.string().min(5).max(3e3),
+        jurisdiction: z2.enum(["india_litigation", "corporate_ma", "global_multi"]),
+        tier: z2.enum(["fast", "expert"]).optional().default("fast"),
+        filters: z2.object({
+          court: z2.string().optional(),
+          judge: z2.string().optional(),
+          statute: z2.string().optional(),
+          caseName: z2.string().optional(),
+          citation: z2.string().optional(),
+          dateFrom: z2.string().optional(),
+          dateTo: z2.string().optional()
+        }).optional()
       });
       const data = schema.parse(req.body);
+      const quota = repository.checkAiQuota(req.authUser.userId);
+      if (!quota.allowed) {
+        res.status(402).json({ error: quota.reason });
+        return;
+      }
       const matter = repository.getMatterForUser(req.authUser.userId, data.matterId);
       if (!matter) {
         res.status(404).json({ error: "Matter not found." });
@@ -5689,17 +8741,21 @@ Facts: ${matter.summaryFacts}`;
         query: data.query,
         jurisdiction: data.jurisdiction,
         matterContext,
-        tier: data.tier
+        tier: data.tier,
+        filters: data.filters
       });
       const saved = repository.addResearchMemo({
         matterId: matter.id,
         userId: req.authUser.userId,
         query: data.query,
         jurisdiction: data.jurisdiction,
+        filters: data.filters,
         answerMarkdown: result.answerMarkdown,
         citations: result.citations,
         citationIntegrity: result.citationIntegrity
       });
+      repository.recordAiUsage(req.authUser.userId, Math.ceil(result.answerMarkdown.length / 4));
+      await repository.persist();
       res.status(201).json(saved);
     } catch (err) {
       res.status(500).json({ error: extractErrorMessage(err) });
@@ -5707,13 +8763,27 @@ Facts: ${matter.summaryFacts}`;
   });
   app.post("/api/ai/research/stream", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        query: z.string().min(5).max(3e3),
-        jurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"]),
-        tier: z.enum(["fast", "expert"]).optional().default("fast")
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        query: z2.string().min(5).max(3e3),
+        jurisdiction: z2.enum(["india_litigation", "corporate_ma", "global_multi"]),
+        tier: z2.enum(["fast", "expert"]).optional().default("fast"),
+        filters: z2.object({
+          court: z2.string().optional(),
+          judge: z2.string().optional(),
+          statute: z2.string().optional(),
+          caseName: z2.string().optional(),
+          citation: z2.string().optional(),
+          dateFrom: z2.string().optional(),
+          dateTo: z2.string().optional()
+        }).optional()
       });
       const data = schema.parse(req.body);
+      const quota = repository.checkAiQuota(req.authUser.userId);
+      if (!quota.allowed) {
+        res.status(402).json({ error: quota.reason });
+        return;
+      }
       const matter = repository.getMatterForUser(req.authUser.userId, data.matterId);
       if (!matter) {
         res.status(404).json({ error: "Matter not found." });
@@ -5739,7 +8809,8 @@ Facts: ${matter.summaryFacts}`;
           query: data.query,
           jurisdiction: data.jurisdiction,
           matterContext,
-          tier: data.tier
+          tier: data.tier,
+          filters: data.filters
         },
         (update) => {
           sendEvent(update.type, update.data);
@@ -5750,11 +8821,14 @@ Facts: ${matter.summaryFacts}`;
         userId: req.authUser.userId,
         query: data.query,
         jurisdiction: data.jurisdiction,
+        filters: data.filters,
         answerMarkdown: result.answerMarkdown,
         citations: result.citations,
         citationIntegrity: result.citationIntegrity
       });
-      sendEvent("complete", saved);
+      repository.recordAiUsage(req.authUser.userId, Math.ceil(result.answerMarkdown.length / 4));
+      await repository.persist();
+      sendEvent("complete", { ...saved, conflicts: result.conflicts });
       res.end();
     } catch (err) {
       if (!res.headersSent) {
@@ -5770,12 +8844,12 @@ data: ${JSON.stringify({ error: extractErrorMessage(err) })}
   });
   app.post("/api/ai/draft-generate", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        title: z.string().min(2).max(200),
-        docType: z.string().min(2).max(100),
-        instructions: z.string().min(5).max(5e3),
-        jurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"])
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        title: z2.string().min(2).max(200),
+        docType: z2.string().min(2).max(100),
+        instructions: z2.string().min(5).max(5e3),
+        jurisdiction: z2.enum(["india_litigation", "corporate_ma", "global_multi"])
       });
       const data = schema.parse(req.body);
       const matter = repository.getMatterForUser(req.authUser.userId, data.matterId);
@@ -5807,10 +8881,10 @@ Facts: ${matter.summaryFacts}`;
   });
   app.post("/api/ai/draft-rewrite", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        selection: z.string().min(5).max(12e3),
-        instruction: z.string().min(2).max(1e3),
-        jurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"])
+      const schema = z2.object({
+        selection: z2.string().min(5).max(12e3),
+        instruction: z2.string().min(2).max(1e3),
+        jurisdiction: z2.enum(["india_litigation", "corporate_ma", "global_multi"])
       });
       const data = schema.parse(req.body);
       const rewritten = await rewriteDraftSelection(data);
@@ -5821,12 +8895,12 @@ Facts: ${matter.summaryFacts}`;
   });
   app.post("/api/ai/courtroom/start", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        mode: z.enum(["bench", "opposing_counsel"]),
-        forumContext: z.string().min(2).max(200),
-        briefExcerpt: z.string().min(10).max(12e3),
-        openingSubmission: z.string().min(5).max(4e3)
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        mode: z2.enum(["bench", "opposing_counsel"]),
+        forumContext: z2.string().min(2).max(200),
+        briefExcerpt: z2.string().min(10).max(12e3),
+        openingSubmission: z2.string().min(5).max(4e3)
       });
       const data = schema.parse(req.body);
       const matter = repository.getMatterForUser(req.authUser.userId, data.matterId);
@@ -5875,8 +8949,8 @@ Facts: ${matter.summaryFacts}`;
   });
   app.post("/api/ai/courtroom/:sessionId/reply", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        submission: z.string().min(3).max(4e3)
+      const schema = z2.object({
+        submission: z2.string().min(3).max(4e3)
       });
       const { submission } = schema.parse(req.body);
       const userId = req.authUser.userId;
@@ -5925,11 +8999,11 @@ Facts: ${matter.summaryFacts}`;
   });
   app.post("/api/ai/contract-redline", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        title: z.string().min(2).max(200),
-        playbook: z.string().min(2).max(160),
-        contractText: z.string().min(30).max(5e4)
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        title: z2.string().min(2).max(200),
+        playbook: z2.string().min(2).max(160),
+        contractText: z2.string().min(30).max(5e4)
       });
       const data = schema.parse(req.body);
       const matter = repository.getMatterForUser(req.authUser.userId, data.matterId);
@@ -5960,14 +9034,14 @@ Facts: ${matter.summaryFacts}`;
   });
   app.post("/api/ai/vault-process", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        fileName: z.string().min(1).max(200),
-        mimeType: z.string().min(1).max(100),
-        docCategory: z.string().max(100).default("Annexure"),
-        base64Data: z.string().max(18e6).optional(),
-        textInput: z.string().max(4e4).optional(),
-        targetLanguage: z.string().max(60).default("None")
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        fileName: z2.string().min(1).max(200),
+        mimeType: z2.string().min(1).max(100),
+        docCategory: z2.string().max(100).default("Annexure"),
+        base64Data: z2.string().max(18e6).optional(),
+        textInput: z2.string().max(4e4).optional(),
+        targetLanguage: z2.string().max(60).default("None")
       });
       const data = schema.parse(req.body);
       if (data.base64Data && !ALLOWED_DOC_MIMES.has(data.mimeType)) {
@@ -5996,13 +9070,17 @@ Facts: ${matter.summaryFacts}`;
         userId,
         fileName: data.fileName,
         mimeType: data.mimeType,
+        fileSizeBytes: data.base64Data ? Math.ceil(data.base64Data.length * 3 / 4) : Buffer.byteLength(data.textInput || "", "utf8"),
         docCategory: data.docCategory,
+        processingStatus: "completed",
         extractedText: result.extractedText,
         translatedText: result.translatedText,
         targetLanguage: data.targetLanguage === "None" ? "" : data.targetLanguage,
+        entities: result.entities,
         chronology: result.chronology,
         contradictions: result.contradictions
       });
+      await repository.persist();
       res.status(201).json(saved);
     } catch (err) {
       res.status(500).json({ error: extractErrorMessage(err) });
@@ -6010,13 +9088,13 @@ Facts: ${matter.summaryFacts}`;
   });
   app.post("/api/ai/meeting-brief", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        title: z.string().min(2).max(200),
-        durationLabel: z.string().max(30).default("05:00"),
-        base64Audio: z.string().max(18e6).optional(),
-        mimeType: z.string().max(100).optional(),
-        transcriptText: z.string().max(4e4).optional()
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        title: z2.string().min(2).max(200),
+        durationLabel: z2.string().max(30).default("05:00"),
+        base64Audio: z2.string().max(18e6).optional(),
+        mimeType: z2.string().max(100).optional(),
+        transcriptText: z2.string().max(4e4).optional()
       });
       const data = schema.parse(req.body);
       if (data.base64Audio && data.mimeType) {
@@ -6050,6 +9128,7 @@ Facts: ${matter.summaryFacts}`;
         actionItems: result.actionItems,
         statutoryIssues: result.statutoryIssues
       });
+      await repository.persist();
       res.status(201).json(saved);
     } catch (err) {
       res.status(500).json({ error: extractErrorMessage(err) });
@@ -6057,16 +9136,16 @@ Facts: ${matter.summaryFacts}`;
   });
   app.post("/api/ai/case-analysis", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        caseTitle: z.string().min(3).max(240),
-        courtLevel: z.string().min(2).max(160),
-        jurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"]),
-        parties: z.string().min(2).max(300),
-        caseStage: z.string().min(2).max(160),
-        userFactsAndData: z.string().min(20).max(25e3),
-        keyLegalQuestions: z.string().max(3e3).default(""),
-        saveToResearch: z.boolean().optional().default(false)
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        caseTitle: z2.string().min(3).max(240),
+        courtLevel: z2.string().min(2).max(160),
+        jurisdiction: z2.enum(["india_litigation", "corporate_ma", "global_multi"]),
+        parties: z2.string().min(2).max(300),
+        caseStage: z2.string().min(2).max(160),
+        userFactsAndData: z2.string().min(20).max(25e3),
+        keyLegalQuestions: z2.string().max(3e3).default(""),
+        saveToResearch: z2.boolean().optional().default(false)
       });
       const data = schema.parse(req.body);
       const userId = req.authUser.userId;
@@ -6130,21 +9209,21 @@ ${vaultSummary}` : ""
   });
   app.post("/api/ai/judiciary-form", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        templateId: z.string().min(2).max(80),
-        courtName: z.string().min(2).max(260),
-        caseNumber: z.string().max(160).default(""),
-        petitionerName: z.string().min(2).max(220),
-        respondentName: z.string().min(2).max(220),
-        deponentName: z.string().max(220).default(""),
-        deponentDetails: z.string().max(500).default(""),
-        factsSummary: z.string().min(10).max(16e3),
-        reliefSought: z.string().max(3e3).default(""),
-        placeOfFiling: z.string().max(120).default("Mumbai / New Delhi"),
-        filingDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-        jurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"]),
-        saveAsDraft: z.boolean().optional().default(true)
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        templateId: z2.string().min(2).max(80),
+        courtName: z2.string().min(2).max(260),
+        caseNumber: z2.string().max(160).default(""),
+        petitionerName: z2.string().min(2).max(220),
+        respondentName: z2.string().min(2).max(220),
+        deponentName: z2.string().max(220).default(""),
+        deponentDetails: z2.string().max(500).default(""),
+        factsSummary: z2.string().min(10).max(16e3),
+        reliefSought: z2.string().max(3e3).default(""),
+        placeOfFiling: z2.string().max(120).default("Mumbai / New Delhi"),
+        filingDate: z2.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        jurisdiction: z2.enum(["india_litigation", "corporate_ma", "global_multi"]),
+        saveAsDraft: z2.boolean().optional().default(true)
       });
       const data = schema.parse(req.body);
       const userId = req.authUser.userId;
@@ -6178,20 +9257,20 @@ Base Facts: ${matter.summaryFacts}`;
   });
   app.post("/api/ai/judiciary-form/stream", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().min(1),
-        templateId: z.string().min(2).max(80),
-        courtName: z.string().min(2).max(260),
-        caseNumber: z.string().max(160).default(""),
-        petitionerName: z.string().min(2).max(220),
-        respondentName: z.string().min(2).max(220),
-        deponentName: z.string().max(220).default(""),
-        deponentDetails: z.string().max(500).default(""),
-        factsSummary: z.string().min(10).max(16e3),
-        reliefSought: z.string().max(3e3).default(""),
-        placeOfFiling: z.string().max(120).default("Mumbai / New Delhi"),
-        filingDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-        jurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"])
+      const schema = z2.object({
+        matterId: z2.string().min(1),
+        templateId: z2.string().min(2).max(80),
+        courtName: z2.string().min(2).max(260),
+        caseNumber: z2.string().max(160).default(""),
+        petitionerName: z2.string().min(2).max(220),
+        respondentName: z2.string().min(2).max(220),
+        deponentName: z2.string().max(220).default(""),
+        deponentDetails: z2.string().max(500).default(""),
+        factsSummary: z2.string().min(10).max(16e3),
+        reliefSought: z2.string().max(3e3).default(""),
+        placeOfFiling: z2.string().max(120).default("Mumbai / New Delhi"),
+        filingDate: z2.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        jurisdiction: z2.enum(["india_litigation", "corporate_ma", "global_multi"])
       });
       const data = schema.parse(req.body);
       const userId = req.authUser.userId;
@@ -6269,6 +9348,7 @@ ${precedentBlock}`;
         docType: tpl.name,
         content: fullText
       });
+      await repository.persist();
       sendEvent("done", {
         draft: savedDraft,
         engineUsed,
@@ -6289,12 +9369,12 @@ data: ${JSON.stringify({ error: extractErrorMessage(err) })}
   });
   app.post("/api/export/docx", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        title: z.string().min(1).max(240),
-        courtHeader: z.string().max(260).optional(),
-        matterCode: z.string().max(80).optional(),
-        docType: z.string().max(120).optional(),
-        content: z.string().min(1).max(2e5)
+      const schema = z2.object({
+        title: z2.string().min(1).max(240),
+        courtHeader: z2.string().max(260).optional(),
+        matterCode: z2.string().max(80).optional(),
+        docType: z2.string().max(120).optional(),
+        content: z2.string().min(1).max(2e5)
       });
       const data = schema.parse(req.body);
       const buffer = await buildCourtDocxBuffer(data);
@@ -6312,11 +9392,11 @@ data: ${JSON.stringify({ error: extractErrorMessage(err) })}
   });
   app.post("/api/ai/assistant", requireAuth, async (req, res) => {
     try {
-      const schema = z.object({
-        matterId: z.string().nullable().optional(),
-        message: z.string().min(1).max(6e3),
-        languageMode: z.enum(["auto", "en", "hi", "bilingual"]).default("auto"),
-        jurisdiction: z.enum(["india_litigation", "corporate_ma", "global_multi"]).optional()
+      const schema = z2.object({
+        matterId: z2.string().nullable().optional(),
+        message: z2.string().min(1).max(6e3),
+        languageMode: z2.enum(["auto", "en", "hi", "bilingual"]).default("auto"),
+        jurisdiction: z2.enum(["india_litigation", "corporate_ma", "global_multi"]).optional()
       });
       const data = schema.parse(req.body);
       const userId = req.authUser.userId;
@@ -6596,12 +9676,12 @@ Facts: ${activeMatter.summaryFacts}` : "No active matter selected.";
     }
   });
   app.delete("/api/ai/assistant", requireAuth, async (req, res) => {
-    repository.clearAssistantMessages(req.authUser.userId);
-    await repository.persist();
+    await repository.clearAssistantMessages(req.authUser.userId);
     res.json({ cleared: true });
   });
+  registerExtendedRoutes(app, metrics);
   if (includeStatic) {
-    if (!IS_PROD) {
+    if (!IS_PROD2) {
       const viteModuleName = "vite";
       const { createServer: createViteServer } = await import(viteModuleName);
       const vite = await createViteServer({

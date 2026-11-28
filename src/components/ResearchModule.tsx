@@ -1,12 +1,14 @@
 import React, { useMemo, useState } from 'react';
 import {
   AlertCircle,
+  AlertTriangle,
   BookOpen,
   Check,
   Clock,
   Copy,
   ExternalLink,
   FileDown,
+  Filter,
   Globe2,
   RefreshCw,
   Scale,
@@ -79,6 +81,21 @@ export function ResearchModule({
   const [streamingText, setStreamingText] = useState('');
   const [currentStage, setCurrentStage] = useState<StreamStage | null>(null);
   const [liveAuthorities, setLiveAuthorities] = useState<LiveAuthority[]>([]);
+  const [conflicts, setConflicts] = useState<
+    Array<{
+      topic: string;
+      supportingAuthority: string;
+      adverseOrDistinguishedAuthority: string;
+      courtHierarchyNote: string;
+      distinctionSummary: string;
+    }>
+  >([]);
+  const [showFilters, setShowFilters] = useState(false);
+  const [filterCourt, setFilterCourt] = useState('');
+  const [filterStatute, setFilterStatute] = useState('');
+  const [filterCaseName, setFilterCaseName] = useState('');
+  const [filterCitation, setFilterCitation] = useState('');
+  const [filterJudge, setFilterJudge] = useState('');
   const [streamStartTime, setStreamStartTime] = useState<number | null>(null);
   const [elapsedSecs, setElapsedSecs] = useState<number>(0);
 
@@ -182,6 +199,16 @@ export function ResearchModule({
           query: query.trim(),
           jurisdiction,
           tier: modelTier,
+          filters:
+            filterCourt || filterStatute || filterCaseName || filterCitation || filterJudge
+              ? {
+                  court: filterCourt || undefined,
+                  statute: filterStatute || undefined,
+                  caseName: filterCaseName || undefined,
+                  citation: filterCitation || undefined,
+                  judge: filterJudge || undefined,
+                }
+              : undefined,
         },
         {
           onStage: (st) => {
@@ -191,6 +218,9 @@ export function ResearchModule({
             if (Array.isArray(data.authorities)) {
               setLiveAuthorities(data.authorities);
             }
+            if (Array.isArray(data.conflicts)) {
+              setConflicts(data.conflicts);
+            }
           },
           onChunk: (delta) => {
             setStreamingText((prev) => prev + delta);
@@ -199,6 +229,9 @@ export function ResearchModule({
       );
 
       clearInterval(timerInterval);
+      if (Array.isArray(memo.conflicts)) {
+        setConflicts(memo.conflicts);
+      }
       onMemoCreated(memo);
       setSelectedMemoId(memo.id);
       setStreamingText('');
@@ -289,6 +322,14 @@ export function ResearchModule({
               />
             </div>
             <button
+              type="button"
+              onClick={() => setShowFilters((f) => !f)}
+              className="neu-btn-secondary px-3.5 py-2 text-xs font-semibold rounded-full inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+            >
+              <Filter className="w-3.5 h-3.5" />
+              <span>Filters</span>
+            </button>
+            <button
               type="submit"
               disabled={loading || !activeMatter}
               className="neu-btn-primary px-6 py-2.5 text-xs font-semibold rounded-full whitespace-nowrap shrink-0 disabled:opacity-50 flex items-center justify-center gap-2"
@@ -306,6 +347,41 @@ export function ResearchModule({
               )}
             </button>
           </div>
+
+          {showFilters && (
+            <div className="neu-inset rounded-2xl p-3.5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5 text-xs">
+              <input
+                value={filterCaseName}
+                onChange={(e) => setFilterCaseName(e.target.value)}
+                placeholder="Case name (e.g. Sushila Aggarwal)"
+                className="neu-input px-3 py-1.5 rounded-lg"
+              />
+              <input
+                value={filterCitation}
+                onChange={(e) => setFilterCitation(e.target.value)}
+                placeholder="Citation (e.g. (2020) 5 SCC 1)"
+                className="neu-input px-3 py-1.5 rounded-lg"
+              />
+              <input
+                value={filterCourt}
+                onChange={(e) => setFilterCourt(e.target.value)}
+                placeholder="Court (Supreme Court / Bombay HC)"
+                className="neu-input px-3 py-1.5 rounded-lg"
+              />
+              <input
+                value={filterJudge}
+                onChange={(e) => setFilterJudge(e.target.value)}
+                placeholder="Judge / Bench"
+                className="neu-input px-3 py-1.5 rounded-lg"
+              />
+              <input
+                value={filterStatute}
+                onChange={(e) => setFilterStatute(e.target.value)}
+                placeholder="Statute & Sec. (482 BNSS / 318 BNS)"
+                className="neu-input px-3 py-1.5 rounded-lg"
+              />
+            </div>
+          )}
 
           {/* Real-Time Live Statute Chips detected while typing */}
           {liveStatuteChips.length > 0 && (
@@ -554,6 +630,33 @@ export function ResearchModule({
                   onCopyCitation={(label) => onToast?.(`Copied citation: ${label}`)}
                 />
               </div>
+
+              {/* Precedent Conflict Detector */}
+              {conflicts.length > 0 && (
+                <div className="mt-6 pt-5 border-t border-stone-hairline space-y-3">
+                  <div className="flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-600" />
+                    <h4 className="font-display text-sm font-semibold text-ink">
+                      Precedent Conflict &amp; Distinction Check ({conflicts.length})
+                    </h4>
+                  </div>
+                  <div className="space-y-2.5">
+                    {conflicts.map((c, idx) => (
+                      <div key={idx} className="neu-inset rounded-xl p-3.5 text-xs space-y-1.5">
+                        <p className="font-semibold text-ink">{c.topic}</p>
+                        <p className="text-emerald-700 dark:text-emerald-300">
+                          <strong>Supporting:</strong> {c.supportingAuthority}
+                        </p>
+                        <p className="text-amber-800 dark:text-amber-300">
+                          <strong>Adverse / Distinguished:</strong> {c.adverseOrDistinguishedAuthority}
+                        </p>
+                        <p className="text-ink-secondary">{c.courtHierarchyNote}</p>
+                        <p className="text-ink-muted">{c.distinctionSummary}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
             <div className="neu-empty rounded-2xl py-12 px-6 text-center text-sm text-ink-muted">
@@ -625,7 +728,21 @@ export function ResearchModule({
                         </a>
                         <p className="text-[11px] text-ink-muted mt-0.5">
                           {cit.courtOrSource || 'Verified Source'}
+                          {cit.sourceTier ? ` · Tier ${cit.sourceTier}` : ''}
                         </p>
+                        <span
+                          className={`mt-1 inline-block px-1.5 py-0.5 rounded text-[10px] font-mono ${
+                            cit.verificationStatus === 'verification_pending' || cit.status === 'caution'
+                              ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                              : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                          }`}
+                        >
+                          {cit.verificationStatus === 'verification_pending'
+                            ? 'Verification Pending (Snippet)'
+                            : cit.verificationStatus === 'verified_legislation'
+                              ? 'Verified Legislation'
+                              : 'Verified Primary Authority'}
+                        </span>
                       </li>
                     ))}
                   </ul>

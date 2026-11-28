@@ -12,11 +12,17 @@ export interface JudiciaryFormTemplate {
   name: string;
   category: JudiciaryFormCategory;
   courtLevel: string;
+  applicableJurisdiction: string;
   statuteBasis: string;
   description: string;
   defaultCourt: string;
   defaultCaseType: string;
   suggestedRelief: string;
+  requiredFields: string[];
+  supportingInstructions: string;
+  version: string;
+  reviewDate: string;
+  validationRules: string[];
 }
 
 export interface JudiciaryFormInput {
@@ -34,7 +40,17 @@ export interface JudiciaryFormInput {
   jurisdiction: JurisdictionMode;
 }
 
-export const JUDICIARY_FORM_TEMPLATES: JudiciaryFormTemplate[] = [
+const BASE_JUDICIARY_FORM_TEMPLATES: Array<
+  Omit<
+    JudiciaryFormTemplate,
+    | 'applicableJurisdiction'
+    | 'requiredFields'
+    | 'supportingInstructions'
+    | 'version'
+    | 'reviewDate'
+    | 'validationRules'
+  >
+> = [
   {
     id: 'general_affidavit',
     name: 'Affidavit-in-Support (Order XIX CPC / SC Rules)',
@@ -192,6 +208,113 @@ export const JUDICIARY_FORM_TEMPLATES: JudiciaryFormTemplate[] = [
     suggestedRelief: 'Grant urgent interim security/injunction and appoint an independent sole arbitrator.',
   },
 ];
+
+const TEMPLATE_METADATA_OVERRIDES: Record<
+  string,
+  Pick<
+    JudiciaryFormTemplate,
+    'applicableJurisdiction' | 'requiredFields' | 'supportingInstructions' | 'validationRules'
+  >
+> = {
+  sec_63_bsa_certificate: {
+    applicableJurisdiction: 'All Indian Courts & Tribunals (BSA 2023)',
+    requiredFields: ['courtName', 'petitionerName', 'respondentName', 'deponentName', 'factsSummary'],
+    supportingInstructions:
+      'Attach Schedule Part A (Custodian declaration) and Part B (Hash value & expert/device specification) per Section 63(4) BSA 2023.',
+    validationRules: [
+      'Must specify device/server details and cryptographic hash algorithm (SHA-256).',
+      'Verify filing date is post-July 1, 2024 for BSA applicability (note IEA Sec. 65B for prior proceedings).',
+    ],
+  },
+  slp_article_136: {
+    applicableJurisdiction: 'Supreme Court of India (Order XXI/XXII SC Rules 2013)',
+    requiredFields: ['courtName', 'petitionerName', 'respondentName', 'factsSummary', 'reliefSought'],
+    supportingInstructions:
+      'Include Synopsis & List of Dates, Questions of Law, Form 28 Declaration, and certified copy of impugned High Court judgment.',
+    validationRules: [
+      'Verify 90-day Limitation Act Art. 133(c) window (60 days if HC refused certificate).',
+      'Cannot omit Declaration in Form 28 regarding prior SLP filings.',
+    ],
+  },
+  anticipatory_bail_482_bnss: {
+    applicableJurisdiction: 'High Courts & Sessions Courts in India (BNSS 2023)',
+    requiredFields: ['courtName', 'petitionerName', 'respondentName', 'factsSummary'],
+    supportingInstructions:
+      'Specify FIR No., Police Station, BNS sections invoked, prior Sec. 35 BNSS notice compliance, and undertaking to cooperate.',
+    validationRules: [
+      'Check state-specific amendments (e.g. U.P. Sec. 438 CrPC / BNSS applicability) before filing.',
+      'Ensure repealed IPC/CrPC sections are mapped to BNS/BNSS 2023.',
+    ],
+  },
+  quashing_528_bnss: {
+    applicableJurisdiction: 'High Courts of India (Inherent Jurisdiction u/s 528 BNSS)',
+    requiredFields: ['courtName', 'petitionerName', 'respondentName', 'factsSummary', 'reliefSought'],
+    supportingInstructions:
+      'Map grounds explicitly to Ch. Bhajan Lal categories and include copy of impugned FIR/Chargesheet.',
+    validationRules: [
+      'Only High Courts possess inherent power u/s 528 BNSS; Sessions Courts cannot entertain quashing petitions.',
+    ],
+  },
+};
+
+export const JUDICIARY_FORM_TEMPLATES: JudiciaryFormTemplate[] = BASE_JUDICIARY_FORM_TEMPLATES.map(
+  (tpl) => {
+    const override = TEMPLATE_METADATA_OVERRIDES[tpl.id];
+    return {
+      ...tpl,
+      applicableJurisdiction: override?.applicableJurisdiction ?? `${tpl.courtLevel} (India)`,
+      requiredFields: override?.requiredFields ?? [
+        'courtName',
+        'petitionerName',
+        'respondentName',
+        'factsSummary',
+      ],
+      supportingInstructions:
+        override?.supportingInstructions ??
+        `Verify local High Court / Registry rules for ${tpl.courtLevel} and attach sworn Order XIX Rule 3 CPC verification.`,
+      version: '2026.2',
+      reviewDate: '2026-10-01',
+      validationRules: override?.validationRules ?? [
+        'Ensure cause title, party names, and verification clause are complete prior to filing.',
+        'Cross-check all repealed IPC/CrPC/IEA references against BNS/BNSS/BSA 2023.',
+      ],
+    };
+  }
+);
+
+export function validateJudiciaryFormInput(input: JudiciaryFormInput): {
+  valid: boolean;
+  warnings: string[];
+  errors: string[];
+} {
+  const tpl = getJudiciaryTemplate(input.templateId);
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  for (const field of tpl.requiredFields) {
+    const val = (input as unknown as Record<string, unknown>)[field];
+    if (typeof val !== 'string' || !val.trim()) {
+      errors.push(`Missing required field "${field}" for ${tpl.name}.`);
+    }
+  }
+
+  if (
+    tpl.id === 'quashing_528_bnss' &&
+    input.courtName.toLowerCase().includes('sessions')
+  ) {
+    warnings.push(
+      'Section 528 BNSS inherent quashing petitions lie exclusively before the High Court, not Sessions Court.'
+    );
+  }
+  if (
+    tpl.id === 'slp_article_136' &&
+    !input.courtName.toLowerCase().includes('supreme')
+  ) {
+    warnings.push('Article 136 Special Leave Petitions lie exclusively before the Supreme Court of India.');
+  }
+
+  return { valid: errors.length === 0, warnings, errors };
+}
 
 export function getJudiciaryTemplate(id: string): JudiciaryFormTemplate {
   return (

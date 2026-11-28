@@ -19,7 +19,11 @@ import {
   getNvidiaConfig,
   streamNvidiaChat,
 } from './nvidiaService';
-import { fetchRealtimeLegalData } from './realtimeLegalSearch';
+import {
+  fetchRealtimeLegalData,
+  type LegalSearchFilters,
+  type PrecedentConflictItem,
+} from './realtimeLegalSearch';
 import {
   formatAiMarkdownResponse,
   formatPlainCourtDocument,
@@ -80,15 +84,18 @@ export async function runGroundedLegalResearch(input: {
   jurisdiction: JurisdictionMode;
   matterContext: string;
   tier?: 'fast' | 'expert';
+  filters?: LegalSearchFilters;
 }): Promise<{
   answerMarkdown: string;
   citations: VerifiedCitation[];
+  conflicts: PrecedentConflictItem[];
   citationIntegrity: CitationIntegritySummary;
 }> {
   const realtime = await fetchRealtimeLegalData(
     input.query,
     input.jurisdiction,
-    input.matterContext
+    input.matterContext,
+    input.filters
   );
 
   // Primary high-speed path: NVIDIA NIM with Supreme Court / High Court precedent grounding
@@ -102,7 +109,7 @@ export async function runGroundedLegalResearch(input: {
 ### Controlling Precedents
 ### Application to Active Matter
 ### Strategic Recommendation & Counter-Arguments
-Keep bullets tight and actionable, cite exact verified case names and section numbers inline, and never include preambles, horizontal rules (---), or code fences.`
+Keep bullets tight and actionable, cite exact verified case names and section numbers inline, distinguish primary verified authorities from unverified search leads, and never include preambles, horizontal rules (---), or code fences.`
       );
       const contextParts = [
         `ACTIVE MATTER CONTEXT:\n${input.matterContext}`,
@@ -125,17 +132,20 @@ Keep bullets tight and actionable, cite exact verified case names and section nu
       return {
         answerMarkdown: formatAiMarkdownResponse(res.text),
         citations: realtime.citations,
+        conflicts: realtime.conflicts,
         citationIntegrity: {
-          verifiedSourceCount: realtime.citations.length,
+          verifiedSourceCount: realtime.citations.filter(
+            (c) => c.verificationStatus !== 'verification_pending'
+          ).length,
           jurisdictionChecked:
             input.jurisdiction === 'india_litigation'
-              ? `NVIDIA NIM (${res.model}) · Live Kanoon & BNS/BNSS/BSA`
+              ? `NVIDIA NIM (${res.model}) · Source Hierarchy & BNS/BNSS/BSA`
               : input.jurisdiction === 'corporate_ma'
                 ? `NVIDIA NIM (${res.model}) · Corporate, M&A & Commercial Statutes`
                 : `NVIDIA NIM (${res.model}) · International Arbitration & Multi-Jurisdiction`,
           bnsComplianceNote:
             input.jurisdiction === 'india_litigation'
-              ? `Generated in ${res.latencyMs}ms with live statutory verification.`
+              ? `Generated in ${res.latencyMs}ms with primary-source hierarchy check.`
               : `Generated in ${res.latencyMs}ms with commercial currency check.`,
           confidenceLabel: 'Grounded via Web & Statute',
         },
@@ -143,6 +153,34 @@ Keep bullets tight and actionable, cite exact verified case names and section nu
     } catch {
       // Fall through to Gemini if configured
     }
+  }
+
+  // Deterministic fallback if neither NVIDIA nor Gemini key is configured
+  if (!isGeminiConfigured()) {
+    const fallbackMd = [
+      '### Executive Conclusion',
+      `Research query analysed against VidhiOS verified Supreme Court / High Court corpus and statutory crosswalk (${realtime.citations.length} source(s) matched). Live AI synthesis requires NVIDIA_API_KEY or GEMINI_API_KEY.`,
+      '',
+      '### Statutory Framework & BNS/BNSS/BSA Alignment',
+      realtime.statutoryGroundingText || 'No specific legacy IPC/CrPC/IEA section detected in query.',
+      '',
+      '### Controlling Precedents',
+      realtime.precedentGroundingText || 'No exact corpus match; inspect primary court databases.',
+    ].join('\n');
+
+    return {
+      answerMarkdown: formatAiMarkdownResponse(fallbackMd),
+      citations: realtime.citations,
+      conflicts: realtime.conflicts,
+      citationIntegrity: {
+        verifiedSourceCount: realtime.citations.filter(
+          (c) => c.verificationStatus !== 'verification_pending'
+        ).length,
+        jurisdictionChecked: 'VidhiOS Deterministic Corpus & Statute Crosswalk',
+        bnsComplianceNote: 'Verified against local statutory crosswalk & SC/HC corpus.',
+        confidenceLabel: 'Statutory Analysis Only',
+      },
+    };
   }
 
   const ai = getAiClient();
@@ -159,7 +197,7 @@ Keep bullets tight and actionable, cite exact verified case names and section nu
 
   const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
   const seenUrls = new Set<string>();
-  const citations: VerifiedCitation[] = [];
+  const citations: VerifiedCitation[] = [...realtime.citations];
 
   for (const chunk of chunks) {
     const web = chunk.web;
@@ -176,6 +214,8 @@ Keep bullets tight and actionable, cite exact verified case names and section nu
         title: web?.title?.trim() || host,
         url: safeUrl,
         courtOrSource: host,
+        sourceTier: 5,
+        verificationStatus: 'verification_pending',
         status: 'verified_web',
       });
     }
@@ -184,8 +224,9 @@ Keep bullets tight and actionable, cite exact verified case names and section nu
   return {
     answerMarkdown: formatAiMarkdownResponse(response.text?.trim() || 'No research output returned.'),
     citations,
+    conflicts: realtime.conflicts,
     citationIntegrity: {
-      verifiedSourceCount: citations.length,
+      verifiedSourceCount: citations.filter((c) => c.verificationStatus !== 'verification_pending').length,
       jurisdictionChecked:
         input.jurisdiction === 'india_litigation'
           ? 'Indian Courts & BNS/BNSS/BSA Statutes'
@@ -208,6 +249,7 @@ export async function streamGroundedLegalResearch(
     jurisdiction: JurisdictionMode;
     matterContext: string;
     tier?: 'fast' | 'expert';
+    filters?: LegalSearchFilters;
   },
   onEvent: (event: {
     type: 'stage' | 'authorities' | 'chunk';
@@ -216,20 +258,22 @@ export async function streamGroundedLegalResearch(
 ): Promise<{
   answerMarkdown: string;
   citations: VerifiedCitation[];
+  conflicts: PrecedentConflictItem[];
   citationIntegrity: CitationIntegritySummary;
 }> {
   onEvent({
     type: 'stage',
     data: {
       stage: 'fetching_realtime',
-      label: 'Fetching real-time legal data, statutory crosswalk & Kanoon authorities...',
+      label: 'Planning query, checking statutory crosswalk & primary court hierarchy...',
     },
   });
 
   const realtime = await fetchRealtimeLegalData(
     input.query,
     input.jurisdiction,
-    input.matterContext
+    input.matterContext,
+    input.filters
   );
 
   onEvent({
@@ -237,6 +281,7 @@ export async function streamGroundedLegalResearch(
     data: {
       authorities: realtime.liveAuthorities,
       citations: realtime.citations,
+      conflicts: realtime.conflicts,
     },
   });
 
@@ -294,11 +339,14 @@ Keep bullets tight and actionable, cite exact verified case names and section nu
       return {
         answerMarkdown: cleanedText,
         citations: realtime.citations,
+        conflicts: realtime.conflicts,
         citationIntegrity: {
-          verifiedSourceCount: realtime.citations.length,
+          verifiedSourceCount: realtime.citations.filter(
+            (c) => c.verificationStatus !== 'verification_pending'
+          ).length,
           jurisdictionChecked:
             input.jurisdiction === 'india_litigation'
-              ? `NVIDIA NIM (${res.model}) · Live Kanoon & BNS/BNSS/BSA`
+              ? `NVIDIA NIM (${res.model}) · Source Hierarchy & BNS/BNSS/BSA`
               : input.jurisdiction === 'corporate_ma'
                 ? `NVIDIA NIM (${res.model}) · Corporate & Commercial Enforceability`
                 : `NVIDIA NIM (${res.model}) · International Arbitration & New York Convention`,
@@ -636,6 +684,47 @@ export async function analyzeContractRedline(input: {
   };
 }
 
+function extractDeterministicEntities(text: string, fileName: string) {
+  const dateMatches = Array.from(
+    new Set(
+      text.match(
+        /\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})\b/gi
+      ) ?? []
+    )
+  ).slice(0, 12);
+  const amountMatches = Array.from(
+    new Set(
+      text.match(/(?:₹|Rs\.?|INR|USD|\$)\s?[\d,.]+(?:\s?(?:Cr|Crore|Lakhs?|Million|M|Bn))?/gi) ?? []
+    )
+  ).slice(0, 10);
+  const statuteMatches = Array.from(
+    new Set(
+      text.match(
+        /\b(?:Section|Sec\.?|Article|Art\.?)\s+\d+[A-Za-z()]*\s*(?:of\s+)?(?:BNS|BNSS|BSA|IPC|CrPC|IEA|CPC|Constitution|Arbitration\s+Act|Contract\s+Act|NI\s+Act)?/gi
+      ) ?? []
+    )
+  ).slice(0, 12);
+  const detectedLanguage = /[\u0900-\u097F]/.test(text) ? 'Hindi / Devanagari' : 'English';
+  const chronology: ChronologyEvent[] = dateMatches.slice(0, 6).map((d) => ({
+    date: d,
+    event: `Referenced event on ${d} in ${fileName}`,
+    sourceDoc: fileName,
+    pageOrPara: 'Extracted text',
+    significance: 'Verify exact factual context against original document.',
+  }));
+  return {
+    entities: {
+      parties: [] as string[],
+      dates: dateMatches,
+      amounts: amountMatches,
+      statutes: statuteMatches,
+      detectedLanguage,
+      summary: text.slice(0, 280).trim() + (text.length > 280 ? '...' : ''),
+    },
+    chronology,
+  };
+}
+
 export async function processVaultDocument(input: {
   fileName: string;
   mimeType: string;
@@ -647,6 +736,14 @@ export async function processVaultDocument(input: {
 }): Promise<{
   extractedText: string;
   translatedText: string;
+  entities: {
+    parties: string[];
+    dates: string[];
+    amounts: string[];
+    statutes: string[];
+    detectedLanguage: string;
+    summary: string;
+  };
   chronology: ChronologyEvent[];
   contradictions: ContradictionItem[];
 }> {
@@ -660,7 +757,7 @@ export async function processVaultDocument(input: {
     try {
       const systemPrompt = buildSupremeCourtSystemPrompt(
         input.jurisdiction,
-        'You are a Forensic Litigation Document Analyst. Return ONLY valid JSON with keys: "extractedText" (string), "translatedText" (string), "chronology" (array of {date, event, sourceDoc, significance}), and "contradictions" (array of {topic, statementA, statementB, severity ("high"|"medium"|"low"), recommendation}).'
+        'You are a Forensic Litigation Document Analyst. Return ONLY valid JSON with keys: "extractedText" (string), "translatedText" (string), "entities" ({parties: string[], dates: string[], amounts: string[], statutes: string[], detectedLanguage: string, summary: string}), "chronology" (array of {date, event, sourceDoc, pageOrPara, significance}), and "contradictions" (array of {topic, statementA, statementB, severity ("high"|"medium"|"low"), recommendation}).'
       );
       const res = await callNvidiaChat({
         systemPrompt,
@@ -672,13 +769,30 @@ export async function processVaultDocument(input: {
       const parsed = extractJsonFromText<{
         extractedText?: string;
         translatedText?: string;
+        entities?: {
+          parties?: string[];
+          dates?: string[];
+          amounts?: string[];
+          statutes?: string[];
+          detectedLanguage?: string;
+          summary?: string;
+        };
         chronology?: ChronologyEvent[];
         contradictions?: ContradictionItem[];
       }>(res.text);
+      const det = extractDeterministicEntities(parsed.extractedText || input.textInput, input.fileName);
       return {
         extractedText: parsed.extractedText || input.textInput,
         translatedText: parsed.translatedText || '',
-        chronology: parsed.chronology ?? [],
+        entities: {
+          parties: parsed.entities?.parties ?? det.entities.parties,
+          dates: parsed.entities?.dates ?? det.entities.dates,
+          amounts: parsed.entities?.amounts ?? det.entities.amounts,
+          statutes: parsed.entities?.statutes ?? det.entities.statutes,
+          detectedLanguage: parsed.entities?.detectedLanguage ?? det.entities.detectedLanguage,
+          summary: parsed.entities?.summary ?? det.entities.summary,
+        },
+        chronology: parsed.chronology ?? det.chronology,
         contradictions: (parsed.contradictions ?? []).map((c) => ({
           ...c,
           severity:
@@ -688,8 +802,19 @@ export async function processVaultDocument(input: {
         })),
       };
     } catch {
-      // Fallback to Gemini
+      // Fallback to Gemini or deterministic
     }
+  }
+
+  if (!isGeminiConfigured() && input.textInput) {
+    const det = extractDeterministicEntities(input.textInput, input.fileName);
+    return {
+      extractedText: input.textInput,
+      translatedText: '',
+      entities: det.entities,
+      chronology: det.chronology,
+      contradictions: [],
+    };
   }
 
   const ai = getAiClient();
@@ -705,7 +830,7 @@ export async function processVaultDocument(input: {
   }
 
   parts.push({
-    text: `Document Name: ${input.fileName}\n${input.textInput ? `Provided Document Text:\n${input.textInput.slice(0, 25000)}\n` : ''}\nExisting Matter Documents Context (for contradiction detection):\n${input.existingDocsContext.slice(0, 12000)}\n\nTasks:\n1. Perform faithful OCR/text extraction preserving legal formatting.\n2. Extract a chronological List of Dates & Events (YYYY-MM-DD where possible) from this document.\n3. Detect any factual, date, monetary, or procedural contradictions between this document and the Existing Matter Documents Context (or internal inconsistencies).\n4. ${translateDirective}`,
+    text: `Document Name: ${input.fileName}\n${input.textInput ? `Provided Document Text:\n${input.textInput.slice(0, 25000)}\n` : ''}\nExisting Matter Documents Context (for contradiction detection):\n${input.existingDocsContext.slice(0, 12000)}\n\nTasks:\n1. Perform faithful OCR/text extraction preserving legal formatting.\n2. Extract a chronological List of Dates & Events (YYYY-MM-DD where possible) with page/paragraph reference.\n3. Detect any factual, date, monetary, or procedural contradictions between this document and the Existing Matter Documents Context (or internal inconsistencies).\n4. ${translateDirective}`,
   });
 
   const response = await ai.models.generateContent({
@@ -759,10 +884,14 @@ export async function processVaultDocument(input: {
     contradictions?: ContradictionItem[];
   };
 
+  const extracted = parsed.extractedText || input.textInput || '';
+  const det = extractDeterministicEntities(extracted, input.fileName);
+
   return {
-    extractedText: parsed.extractedText || input.textInput || '',
+    extractedText: extracted,
     translatedText: parsed.translatedText || '',
-    chronology: parsed.chronology ?? [],
+    entities: det.entities,
+    chronology: parsed.chronology ?? det.chronology,
     contradictions: (parsed.contradictions ?? []).map((c) => ({
       ...c,
       severity:

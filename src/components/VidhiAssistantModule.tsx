@@ -4,12 +4,17 @@ import {
   Check,
   CheckCircle2,
   Copy,
+  Download,
   FileDown,
   FileText,
   Languages,
+  RotateCw,
   Send,
   ShieldCheck,
   Sparkles,
+  Square,
+  ThumbsDown,
+  ThumbsUp,
   Trash2,
 } from 'lucide-react';
 import { api } from '../lib/api';
@@ -106,8 +111,10 @@ export function VidhiAssistantModule({
   const [sending, setSending] = useState(false);
   const [exportingKey, setExportingKey] = useState<string | null>(null);
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
+  const [feedbackMap, setFeedbackMap] = useState<Record<string, 'up' | 'down'>>({});
   const [error, setError] = useState<string | null>(null);
   const scrollEndRef = useRef<HTMLDivElement | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const handleCopyAssistantReply = async (msg: AssistantMessage) => {
     const cleanText = stripMarkdownForPlainText(msg.content);
@@ -133,14 +140,19 @@ export function VidhiAssistantModule({
     setError(null);
     setSending(true);
     const activeLang = langOverride ?? languageMode;
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
     try {
-      const res = await api.sendAssistantMessage({
-        matterId: activeMatter?.id ?? null,
-        message: trimmed,
-        languageMode: activeLang,
-        jurisdiction,
-      });
+      const res = await api.sendAssistantMessage(
+        {
+          matterId: activeMatter?.id ?? null,
+          message: trimmed,
+          languageMode: activeLang,
+          jurisdiction,
+        },
+        controller.signal
+      );
       onMessageExchanged(
         res.userMsg,
         res.assistantMsg,
@@ -154,10 +166,41 @@ export function VidhiAssistantModule({
         onToast(`Deadline pinned: "${res.createdDeadline.title}"`);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Assistant request failed.');
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        onToast('Generation stopped.');
+      } else {
+        setError(err instanceof Error ? err.message : 'Assistant request failed.');
+      }
     } finally {
+      abortControllerRef.current = null;
       setSending(false);
     }
+  };
+
+  const handleStopGeneration = () => {
+    abortControllerRef.current?.abort();
+  };
+
+  const handleRegenerateLast = () => {
+    const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
+    if (lastUserMsg) {
+      void sendMessage(lastUserMsg.content);
+    }
+  };
+
+  const handleExportConversation = () => {
+    if (messages.length === 0) return;
+    const content = messages
+      .map((m) => `[${m.createdAt}] ${m.role.toUpperCase()}:\n${m.content}`)
+      .join('\n\n---\n\n');
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `vidhios-assistant-${activeMatter?.matterCode || 'session'}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    onToast('Exported conversation transcript.');
   };
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -240,15 +283,25 @@ export function VidhiAssistantModule({
           </div>
 
           {messages.length > 0 && (
-            <button
-              type="button"
-              onClick={handleClear}
-              aria-label="Clear conversation"
-              className="neu-btn-secondary inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-full whitespace-nowrap"
-            >
-              <Trash2 className="w-3.5 h-3.5" strokeWidth={2} />
-              <span>Clear</span>
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={handleExportConversation}
+                className="neu-btn-secondary inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg whitespace-nowrap"
+              >
+                <Download className="w-3.5 h-3.5" strokeWidth={2} />
+                <span>Export</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleClear}
+                aria-label="Clear conversation"
+                className="neu-btn-secondary inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg whitespace-nowrap"
+              >
+                <Trash2 className="w-3.5 h-3.5" strokeWidth={2} />
+                <span>Clear</span>
+              </button>
+            </>
           )}
         </div>
       </section>
@@ -415,12 +468,47 @@ export function VidhiAssistantModule({
                         </div>
                       )}
 
-                      {/* Verified Sources & Provenance */}
+                      {/* Verified Sources, Feedback & Suggested Follow-ups */}
                       {!isUser && (
                         <div className="pt-2 border-t border-stone-hairline space-y-2">
-                          <div className="flex items-center gap-1.5 text-[11px] font-mono text-[#156a53] dark:text-emerald-300">
-                            <ShieldCheck className="w-3.5 h-3.5 shrink-0" strokeWidth={2} />
-                            <span>{msg.confidenceNote}</span>
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-1.5 text-[11px] font-mono text-[#156a53] dark:text-emerald-300">
+                              <ShieldCheck className="w-3.5 h-3.5 shrink-0" strokeWidth={2} />
+                              <span>{msg.confidenceNote}</span>
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={handleRegenerateLast}
+                                disabled={sending}
+                                title="Regenerate response"
+                                className="p-1 rounded text-ink-muted hover:text-ink"
+                              >
+                                <RotateCw className="w-3 h-3" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setFeedbackMap((f) => ({ ...f, [msg.id]: 'up' }));
+                                  onToast('Quality feedback recorded.');
+                                }}
+                                title="Accurate & helpful"
+                                className={`p-1 rounded ${feedbackMap[msg.id] === 'up' ? 'text-emerald-600' : 'text-ink-muted hover:text-ink'}`}
+                              >
+                                <ThumbsUp className="w-3 h-3" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setFeedbackMap((f) => ({ ...f, [msg.id]: 'down' }));
+                                  onToast('Issue flagged for quality review.');
+                                }}
+                                title="Flag inaccuracy / missing verification"
+                                className={`p-1 rounded ${feedbackMap[msg.id] === 'down' ? 'text-red-600' : 'text-ink-muted hover:text-ink'}`}
+                              >
+                                <ThumbsDown className="w-3 h-3" />
+                              </button>
+                            </div>
                           </div>
                           {msg.sources.length > 0 && (
                             <div className="flex flex-wrap gap-1.5">
@@ -434,6 +522,23 @@ export function VidhiAssistantModule({
                               ))}
                             </div>
                           )}
+                          <div className="flex flex-wrap gap-1.5 pt-1">
+                            {[
+                              'List missing facts or documents',
+                              'Check BNS/BNSS/BSA sections',
+                              'Draft supporting Affidavit',
+                            ].map((followUp) => (
+                              <button
+                                key={followUp}
+                                type="button"
+                                disabled={sending}
+                                onClick={() => void sendMessage(followUp)}
+                                className="px-2 py-0.5 rounded-md border border-stone-hairline text-[10px] font-medium text-teal-accent hover:bg-[var(--surface)] transition-colors"
+                              >
+                                + {followUp}
+                              </button>
+                            ))}
+                          </div>
                         </div>
                       )}
                     </div>
@@ -473,14 +578,25 @@ export function VidhiAssistantModule({
               }
               className="neu-input flex-1 px-4 py-2.5 text-xs sm:text-sm rounded-full"
             />
-            <button
-              type="submit"
-              disabled={sending || !input.trim()}
-              className="neu-btn-primary inline-flex items-center justify-center gap-1.5 px-5 py-2.5 text-xs font-semibold rounded-full whitespace-nowrap shrink-0 disabled:opacity-50"
-            >
-              <Send className="w-3.5 h-3.5" strokeWidth={2} />
-              <span>{sending ? 'Executing...' : 'Send / भेजें'}</span>
-            </button>
+            {sending ? (
+              <button
+                type="button"
+                onClick={handleStopGeneration}
+                className="neu-btn-secondary inline-flex items-center justify-center gap-1.5 px-5 py-2.5 text-xs font-semibold rounded-full whitespace-nowrap shrink-0 text-red-700 dark:text-red-400"
+              >
+                <Square className="w-3.5 h-3.5" strokeWidth={2} />
+                <span>Stop</span>
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!input.trim()}
+                className="neu-btn-primary inline-flex items-center justify-center gap-1.5 px-5 py-2.5 text-xs font-semibold rounded-full whitespace-nowrap shrink-0 disabled:opacity-50"
+              >
+                <Send className="w-3.5 h-3.5" strokeWidth={2} />
+                <span>Send / भेजें</span>
+              </button>
+            )}
           </form>
         </section>
 

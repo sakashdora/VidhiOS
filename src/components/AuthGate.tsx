@@ -184,7 +184,7 @@ export function AuthGate({ onAuthenticated }: AuthGateProps) {
               organization,
               defaultJurisdiction,
             });
-      setAuthToken(res.token);
+      setAuthToken(res.token, res.csrfToken);
       onAuthenticated(res.user);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Authentication failed.');
@@ -198,7 +198,7 @@ export function AuthGate({ onAuthenticated }: AuthGateProps) {
     setSubmitting(true);
     try {
       const res = await api.demoLogin();
-      setAuthToken(res.token);
+      setAuthToken(res.token, res.csrfToken);
       onAuthenticated(res.user);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not open demo workspace.');

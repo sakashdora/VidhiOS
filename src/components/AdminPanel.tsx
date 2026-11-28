@@ -19,7 +19,15 @@ import {
   X,
 } from 'lucide-react';
 import { api } from '../lib/api';
-import type { AdminUserSummary, JurisdictionMode, UserProfile } from '../types/legal';
+import type {
+  AdminUserSummary,
+  AuditEventItem,
+  JurisdictionMode,
+  Organization,
+  SubscriptionRecord,
+  SubscriptionTier,
+  UserProfile,
+} from '../types/legal';
 
 interface AdminPanelProps {
   currentUser: UserProfile;
@@ -27,7 +35,15 @@ interface AdminPanelProps {
 }
 
 export function AdminPanel({ currentUser, onToast }: AdminPanelProps) {
+  const [adminTab, setAdminTab] = useState<'users' | 'orgs' | 'monitoring' | 'audit'>('users');
   const [users, setUsers] = useState<AdminUserSummary[]>([]);
+  const [overview, setOverview] = useState<{
+    organizations: Array<Organization & { membersCount: number; subscription?: SubscriptionRecord }>;
+    auditEvents: AuditEventItem[];
+    counts: Record<string, number>;
+    metrics: Record<string, any>;
+    health: Record<string, any>;
+  } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -71,12 +87,23 @@ export function AdminPanel({ currentUser, onToast }: AdminPanelProps) {
     try {
       setLoading(true);
       setError(null);
-      const res = await api.getAdminUsers();
+      const [res, ov] = await Promise.all([api.getAdminUsers(), api.getAdminOverview()]);
       setUsers(res.users);
+      setOverview(ov);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load user roster.');
+      setError(err instanceof Error ? err.message : 'Failed to load admin console.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleOrgTierChange = async (orgId: string, tier: SubscriptionTier) => {
+    try {
+      await api.updateOrgSubscription(orgId, tier);
+      onToast(`Updated organization plan to ${tier}.`);
+      await fetchUsers();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'Failed to update subscription.');
     }
   };
 
@@ -263,6 +290,127 @@ export function AdminPanel({ currentUser, onToast }: AdminPanelProps) {
         </div>
       </div>
 
+      {/* Admin Navigation Tabs */}
+      <div className="neu-tab-bar rounded-xl p-1 flex flex-wrap gap-1">
+        {(
+          [
+            ['users', `Users & Roles (${users.length})`],
+            ['orgs', `Organizations & Plans (${overview?.organizations.length ?? 0})`],
+            ['monitoring', 'System, DB & AI Health'],
+            ['audit', `Audit History (${overview?.auditEvents.length ?? 0})`],
+          ] as const
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => setAdminTab(id)}
+            className={`px-3.5 py-2 text-xs font-semibold rounded-lg transition-colors ${
+              adminTab === id ? 'bg-[#0d5c63] text-white' : 'text-ink-secondary hover:text-ink'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {adminTab === 'orgs' && overview && (
+        <div className="neu-card rounded-xl overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr className="neu-table-head text-ink-secondary">
+                  <th className="py-3 px-4 font-semibold">Organization</th>
+                  <th className="py-3 px-4 font-semibold">Members</th>
+                  <th className="py-3 px-4 font-semibold">AI Usage</th>
+                  <th className="py-3 px-4 font-semibold">Storage</th>
+                  <th className="py-3 px-4 font-semibold">Plan Tier</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[var(--border-hairline)]">
+                {overview.organizations.map((org) => (
+                  <tr key={org.id}>
+                    <td className="py-3 px-4">
+                      <p className="font-semibold text-ink">{org.name}</p>
+                      <p className="font-mono text-[10px] text-ink-muted">{org.slug}</p>
+                    </td>
+                    <td className="py-3 px-4 font-mono">{org.membersCount}</td>
+                    <td className="py-3 px-4 font-mono">
+                      {org.subscription?.aiQueriesUsed ?? 0} / {org.subscription?.aiQueriesLimit ?? 0} ({org.subscription?.aiTokensUsed ?? 0} tok)
+                    </td>
+                    <td className="py-3 px-4 font-mono">
+                      {org.subscription?.storageUsedMb ?? 0} / {org.subscription?.storageLimitMb ?? 0} MB
+                    </td>
+                    <td className="py-3 px-4">
+                      <select
+                        value={org.subscription?.tier ?? org.tier}
+                        onChange={(e) => handleOrgTierChange(org.id, e.target.value as SubscriptionTier)}
+                        className="neu-input px-2.5 py-1 text-xs rounded-lg"
+                      >
+                        <option value="FREE">FREE</option>
+                        <option value="PRO">PRO</option>
+                        <option value="CHAMBERS">CHAMBERS</option>
+                        <option value="ENTERPRISE">ENTERPRISE</option>
+                      </select>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {adminTab === 'monitoring' && overview && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-5 text-xs">
+          <div className="neu-card rounded-xl p-5 space-y-2.5">
+            <h3 className="font-display text-sm font-semibold text-ink">Database &amp; Storage Health</h3>
+            <p>Storage Engine: <strong className="font-mono text-teal-accent">{overview.health.storageEngine}</strong></p>
+            <p>Neon Connectivity: <strong className="font-mono">{overview.health.neon?.ok ? `Healthy (${overview.health.neon.latencyMs}ms)` : overview.health.neon?.error || 'Local Mode'}</strong></p>
+            <p>Last DB Sync: <strong className="font-mono">{overview.health.neonSync?.lastDbSyncAt || 'N/A'}</strong></p>
+            <p>Failed Vault Jobs: <strong className="font-mono">{overview.counts.failedVaultJobs}</strong> · Queued: <strong className="font-mono">{overview.counts.queuedVaultJobs}</strong></p>
+            {overview.health.lastPersistError && (
+              <p className="text-red-600">Last Persist Error: {overview.health.lastPersistError}</p>
+            )}
+          </div>
+          <div className="neu-card rounded-xl p-5 space-y-2.5">
+            <h3 className="font-display text-sm font-semibold text-ink">API &amp; AI Provider Telemetry</h3>
+            <p>Total Requests: <strong className="font-mono">{overview.metrics.totalRequests}</strong> · 5xx Errors: <strong className="font-mono">{overview.metrics.errorCount}</strong></p>
+            <p>Avg API Latency: <strong className="font-mono">{overview.metrics.avgLatencyMs}ms</strong></p>
+            <p>AI Requests: <strong className="font-mono">{overview.metrics.aiRequestCount}</strong> · AI Failures: <strong className="font-mono">{overview.metrics.aiFailureCount}</strong></p>
+            <p>NVIDIA NIM: <strong className="font-mono">{overview.health.aiEngine?.nvidiaConfigured ? 'Configured' : 'Unconfigured'}</strong> ({overview.health.aiEngine?.primaryModel})</p>
+            <p>Google Gemini: <strong className="font-mono">{overview.health.aiEngine?.geminiConfigured ? 'Configured' : 'Unconfigured'}</strong></p>
+            <p>Corporate MCA API: <strong className="font-mono">{overview.health.corporateProviderConfigured ? 'Configured' : 'Sandbox Mock Mode'}</strong></p>
+          </div>
+        </div>
+      )}
+
+      {adminTab === 'audit' && overview && (
+        <div className="neu-card rounded-xl p-5 space-y-3">
+          <h3 className="font-display text-sm font-semibold text-ink">Security &amp; Access Audit Log</h3>
+          <div className="divide-y divide-[var(--border-hairline)] text-xs max-h-96 overflow-y-auto">
+            {overview.auditEvents.map((ae) => (
+              <div key={ae.id} className="py-2.5 flex items-start justify-between gap-3">
+                <div>
+                  <p className="font-medium text-ink">
+                    <span className="font-mono text-teal-accent mr-2">{ae.eventType}</span>
+                    {ae.actorEmail}
+                  </p>
+                  <p className="text-ink-muted">{ae.details}</p>
+                </div>
+                <span className="font-mono text-[10px] text-ink-muted shrink-0">
+                  {ae.status} · {ae.createdAt.slice(0, 16).replace('T', ' ')}
+                </span>
+              </div>
+            ))}
+            {overview.auditEvents.length === 0 && (
+              <p className="text-ink-muted py-4">No audit events logged yet.</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {adminTab === 'users' && (
+        <>
       {/* Aggregate Metrics Bar */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="neu-card rounded-2xl p-4">
@@ -530,6 +678,8 @@ export function AdminPanel({ currentUser, onToast }: AdminPanelProps) {
           </table>
         </div>
       </div>
+        </>
+      )}
 
       {/* CREATE USER MODAL */}
       {showCreateModal && (

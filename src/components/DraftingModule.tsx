@@ -5,11 +5,14 @@ import {
   CheckCircle2,
   Download,
   FileDown,
+  History,
   Plus,
+  Printer,
   RefreshCw,
   Save,
   Search,
   Sparkles,
+  X,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import {
@@ -53,6 +56,8 @@ export function DraftingModule({
   const [crosswalkQuery, setCrosswalkQuery] = useState('');
   const [saving, setSaving] = useState(false);
   const [exportingDocx, setExportingDocx] = useState(false);
+  const [showVersionModal, setShowVersionModal] = useState(false);
+  const [compareVersionNum, setCompareVersionNum] = useState<number | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [rewritePrompt, setRewritePrompt] = useState('');
@@ -208,6 +213,30 @@ export function DraftingModule({
     onToast('Exported draft as Markdown (.md).');
   };
 
+  const handlePrintPdf = () => {
+    if (!editorContent) return;
+    const printWin = window.open('', '_blank', 'width=880,height=720');
+    if (!printWin) {
+      onToast('Allow popups to export/print PDF.');
+      return;
+    }
+    const safeTitle = (editorTitle || 'Legal Draft').replace(/</g, '&lt;');
+    const safeBody = editorContent.replace(/</g, '&lt;').replace(/\n/g, '<br/>');
+    printWin.document.write(`<!doctype html><html><head><title>${safeTitle}</title><style>body{font-family:'Times New Roman',serif;margin:1in 1.2in;line-height:1.6;font-size:12pt;color:#111}h1{font-size:14pt;text-align:center;text-transform:uppercase;margin-bottom:24px}</style></head><body><h1>${safeTitle}</h1><div>${safeBody}</div><script>window.onload=()=>{window.print();}</script></body></html>`);
+    printWin.document.close();
+  };
+
+  const handleStatusChange = async (status: DraftDocument['status']) => {
+    if (!currentDraft) return;
+    try {
+      const updated = await api.updateDraft(currentDraft.id, { status });
+      onDraftUpdated(updated);
+      onToast(`Draft status updated to ${status?.replace('_', ' ')}.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Status update failed.');
+    }
+  };
+
   const handleExportDocx = async () => {
     if (!editorContent) return;
     setExportingDocx(true);
@@ -356,6 +385,25 @@ export function DraftingModule({
             <Download className="w-3.5 h-3.5" strokeWidth={2} />
             <span>.MD</span>
           </button>
+          <button
+            type="button"
+            disabled={!editorContent}
+            onClick={handlePrintPdf}
+            className="neu-btn-secondary inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-full disabled:opacity-50 whitespace-nowrap shrink-0"
+          >
+            <Printer className="w-3.5 h-3.5" strokeWidth={2} />
+            <span>PDF</span>
+          </button>
+          {currentDraft && (
+            <button
+              type="button"
+              onClick={() => setShowVersionModal(true)}
+              className="neu-btn-secondary inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-full whitespace-nowrap shrink-0"
+            >
+              <History className="w-3.5 h-3.5" strokeWidth={2} />
+              <span>History ({currentDraft.versions?.length ?? 1})</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -460,9 +508,21 @@ export function DraftingModule({
               className="font-display text-base font-semibold text-ink bg-transparent focus:outline-none w-full"
             />
             {currentDraft && (
-              <span className="font-mono text-xs tabular-nums text-ink-muted whitespace-nowrap shrink-0">
-                v{currentDraft.version} · {editorContent.split(/\s+/).filter(Boolean).length} words
-              </span>
+              <div className="flex items-center gap-2 shrink-0">
+                <select
+                  aria-label="Draft review status"
+                  value={currentDraft.status || 'draft'}
+                  onChange={(e) => handleStatusChange(e.target.value as DraftDocument['status'])}
+                  className="neu-input px-2.5 py-1 text-[11px] font-medium rounded-lg"
+                >
+                  <option value="draft">Draft</option>
+                  <option value="awaiting_review">Awaiting Review</option>
+                  <option value="approved">Approved</option>
+                </select>
+                <span className="font-mono text-xs tabular-nums text-ink-muted whitespace-nowrap">
+                  v{currentDraft.version} · {editorContent.split(/\s+/).filter(Boolean).length} words
+                </span>
+              </div>
             )}
           </div>
 
@@ -484,7 +544,15 @@ export function DraftingModule({
                 <span>Inline Paragraph AI Rewrite (highlight text in editor)</span>
               </span>
               <div className="flex flex-wrap gap-2">
-                {['Strengthen Authority', 'Make Concise', 'Formal Court Tone'].map((preset) => (
+                {[
+                  'Strengthen Authority',
+                  'Make Concise',
+                  'Formal Court Tone',
+                  'Simplify Language',
+                  'Identify Missing Facts',
+                  'Identify Procedural Issues',
+                  'Translate to Hindi',
+                ].map((preset) => (
                   <button
                     key={preset}
                     type="button"
@@ -660,6 +728,62 @@ export function DraftingModule({
         </aside>
       </div>
         </>
+      )}
+
+      {showVersionModal && currentDraft && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Draft Version History"
+          className="fixed inset-0 z-50 bg-[#101617]/60 backdrop-blur-xs flex items-center justify-center p-4"
+        >
+          <div className="w-full max-w-4xl neu-modal rounded-2xl p-6 space-y-4 max-h-[85vh] flex flex-col">
+            <div className="flex items-center justify-between pb-3 border-b border-stone-hairline">
+              <h3 className="font-display text-base font-semibold text-ink">
+                Version History &amp; Comparison — {currentDraft.title}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setShowVersionModal(false)}
+                className="neu-btn-secondary p-1.5 rounded-lg"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-4 flex-1 overflow-hidden">
+              <div className="md:col-span-4 space-y-2 overflow-y-auto pr-1">
+                {(currentDraft.versions ?? []).map((ver) => (
+                  <button
+                    key={ver.version}
+                    type="button"
+                    onClick={() => setCompareVersionNum(ver.version)}
+                    className={`w-full text-left p-3 rounded-lg border text-xs ${
+                      compareVersionNum === ver.version
+                        ? 'bg-[#0d5c63] border-[#0d5c63] text-white'
+                        : 'neu-inset text-ink'
+                    }`}
+                  >
+                    <p className="font-mono font-semibold">Version {ver.version}</p>
+                    <p className="text-[11px] opacity-80 mt-0.5">
+                      {ver.savedBy || 'Counsel'} · {ver.savedAt.slice(0, 16).replace('T', ' ')}
+                    </p>
+                  </button>
+                ))}
+                {(currentDraft.versions ?? []).length === 0 && (
+                  <p className="text-xs text-ink-muted">Current version v{currentDraft.version} only.</p>
+                )}
+              </div>
+              <div className="md:col-span-8 neu-inset rounded-xl p-4 overflow-y-auto text-xs whitespace-pre-wrap leading-relaxed text-ink">
+                {(() => {
+                  const snap = (currentDraft.versions ?? []).find(
+                    (v) => v.version === compareVersionNum
+                  );
+                  return snap ? snap.content : editorContent;
+                })()}
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
